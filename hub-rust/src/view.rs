@@ -8,7 +8,8 @@
 //! exactly what AG-Grid's VRM expects and what `expandRow` drives.
 
 use crate::query::{
-    aggregate_over, filtered_slots, group_key_string, group_slots, sort_slots, AggSpec, Agg, Filter, SortKey,
+    aggregate_over, filtered_slots, group_key_string, group_slots, row_matches, sort_slots,
+    AggSpec, Agg, Filter, SortKey,
 };
 use crate::store::{TableCache, Value};
 use serde_json::{json, Value as Json};
@@ -85,6 +86,7 @@ pub struct View {
     /// are what the tests assert on and what a diagnostics pane would report.
     order_builds: u64,
     tree_builds: u64,
+    order_patches: u64,
 }
 
 /// A materialized slot order plus the revision that produced it.
@@ -93,7 +95,20 @@ struct SlotMemo {
     /// Filtered slots; additionally sorted when the view is flat (a grouped view
     /// sorts leaves within each group, so the pre-group order is irrelevant).
     slots: Vec<usize>,
+    /// Slot -> in the filtered set. Carried alongside `slots` so a patch can ask
+    /// "was this row in the view?" in O(1); answering it by searching `slots`
+    /// would make each patched row O(n) and the patch no cheaper than the scan
+    /// it replaces.
+    member: Vec<bool>,
 }
+
+/// Past this share of the table, patching costs more than rebuilding.
+///
+/// A patch is O(touched) predicate evaluations plus one O(slots) pass over a
+/// bool vector; a rebuild is O(live) predicate evaluations. The predicate is the
+/// expensive half — it clones a `Value` per column it reads — so the crossover
+/// is well below "half the table", not at it.
+const PATCH_MAX_TOUCH_RATIO: usize = 4;
 
 /// A materialized group tree plus the (revision, expansion) it was built for.
 struct TreeMemo {
@@ -114,7 +129,7 @@ const TREE_MEMO_MAX_ROWS: usize = 50_000;
 impl View {
     pub fn new(cache: Arc<Mutex<TableCache>>, spec: ViewSpec, session_id: String) -> View {
         View { cache, spec, session_id, expanded: HashSet::new(), memo: None, tree: None, expand_gen: 0,
-               order_builds: 0, tree_builds: 0 }
+               order_builds: 0, tree_builds: 0, order_patches: 0 }
     }
 
     /// Rebuild the slot order if the cache has moved since it was built.
@@ -123,13 +138,68 @@ impl View {
     /// group changes which rows are VISIBLE, never which rows pass the filter.
     fn refresh_memo(&mut self, cache: &TableCache) {
         let revision = cache.revision();
-        if matches!(&self.memo, Some(m) if m.revision == revision) { return; }
+        let prev = match &self.memo {
+            Some(m) if m.revision == revision => return,
+            Some(m) => Some(m.revision),
+            None => None,
+        };
+
+        // Only a view that is already current-ish can be patched: the touch log
+        // is bounded, and a big enough change set is cheaper to rebuild.
+        if let Some(prev) = prev {
+            if let Some(touched) = cache.touched_since(prev) {
+                if touched.len().saturating_mul(PATCH_MAX_TOUCH_RATIO) < cache.len().max(1) {
+                    self.patch_memo(cache, revision, &touched);
+                    return;
+                }
+            }
+        }
+        self.rebuild_memo(cache, revision);
+    }
+
+    fn rebuild_memo(&mut self, cache: &TableCache, revision: u64) {
         let mut slots = filtered_slots(cache, &self.spec.filter);
         if self.spec.group_cols.is_empty() {
             sort_slots(cache, &mut slots, &self.spec.sort);
         }
-        self.memo = Some(SlotMemo { revision, slots });
+        let mut member = vec![false; cache.slot_count()];
+        for &s in &slots { member[s] = true; }
+        self.memo = Some(SlotMemo { revision, slots, member });
         self.order_builds += 1;
+    }
+
+    /// Bring the memo forward by re-testing only the rows that actually moved.
+    ///
+    /// The filter scan is the cost that does NOT shrink with a selective filter,
+    /// so replacing it with one predicate evaluation per changed row is the
+    /// whole point. The rest is bookkeeping: rebuild the dense slot vector from
+    /// the membership map (a bool scan, no predicate, no `Value` clones), and
+    /// re-sort a flat view because a touched row's sort key may have changed
+    /// even when its membership did not.
+    fn patch_memo(&mut self, cache: &TableCache, revision: u64, touched: &[usize]) {
+        let Some(memo) = self.memo.as_mut() else { return self.rebuild_memo(cache, revision) };
+        if memo.member.len() < cache.slot_count() { memo.member.resize(cache.slot_count(), false); }
+
+        let mut dirty = false;
+        for &slot in touched {
+            let now_in = cache.is_live(slot) && row_matches(cache, &self.spec.filter, slot);
+            if memo.member[slot] != now_in { memo.member[slot] = now_in; dirty = true; }
+        }
+
+        if dirty {
+            memo.slots = (0..memo.member.len()).filter(|&s| memo.member[s]).collect();
+        }
+        // A touched row that stayed a member can still have moved in the sort, so
+        // a flat view reorders whenever anything moved — not only when membership
+        // changed. A grouped view does not: it sorts leaves within each group.
+        let needs_sort = self.spec.group_cols.is_empty() && !touched.is_empty();
+        if needs_sort {
+            let mut slots = std::mem::take(&mut memo.slots);
+            sort_slots(cache, &mut slots, &self.spec.sort);
+            memo.slots = slots;
+        }
+        memo.revision = revision;
+        self.order_patches += 1;
     }
 
     /// The memoized slot order. Call `refresh_memo` first.
@@ -147,6 +217,8 @@ impl View {
     pub fn order_builds(&self) -> u64 { self.order_builds }
     /// Times the flattened tree was rebuilt since this view opened.
     pub fn tree_builds(&self) -> u64 { self.tree_builds }
+    /// Times the slot order was PATCHED rather than rebuilt.
+    pub fn order_patches(&self) -> u64 { self.order_patches }
 
     /// Rebuild the flattened tree if the data or the expansion state has moved.
     ///
@@ -363,6 +435,107 @@ mod memo_tests {
         cache.lock().unwrap().upsert("P0", json!({ "id": "P0", "mv": 99 }).as_object().unwrap());
         let (rows, _) = v.read_window(0, Some(1));
         assert_eq!(rows[0]["mv"], json!(99), "memo must not survive the row that outranks its head");
+    }
+
+    #[test]
+    fn a_small_change_patches_the_order_instead_of_rebuilding() {
+        let cache = cache_with(200);
+        let mut v = view(cache.clone(), json!({
+            "filter": [{ "column": "desk", "op": "equals", "value": "govies" }],
+            "sort": [{ "column": "mv", "sort": "asc" }],
+        }));
+        v.read_window(0, Some(10));
+        assert_eq!(v.order_builds(), 1);
+        assert_eq!(v.order_patches(), 0);
+
+        // Two rows move out of 200 — far too few to justify rescanning the table.
+        {
+            let mut c = cache.lock().unwrap();
+            c.begin_batch();
+            c.upsert("P0", json!({ "id": "P0", "mv": 5.0 }).as_object().unwrap());
+            c.upsert("P2", json!({ "id": "P2", "mv": 6.0 }).as_object().unwrap());
+            c.end_batch();
+        }
+        v.read_window(0, Some(10));
+        assert_eq!(v.order_builds(), 1, "no rebuild");
+        assert_eq!(v.order_patches(), 1, "patched instead");
+    }
+
+    #[test]
+    fn a_patch_agrees_with_a_rebuild_on_membership_and_order() {
+        let cache = cache_with(300);
+        let spec = json!({
+            "filter": [{ "column": "mv", "op": "greaterThan", "value": 100 }],
+            "sort": [{ "column": "mv", "sort": "desc" }],
+        });
+        let mut patched = view(cache.clone(), spec.clone());
+        patched.read_window(0, Some(5));
+
+        // Move rows ACROSS the filter boundary in both directions, plus a delete.
+        {
+            let mut c = cache.lock().unwrap();
+            c.begin_batch();
+            c.upsert("P5", json!({ "id": "P5", "mv": 9999.0 }).as_object().unwrap());   // enters
+            c.upsert("P250", json!({ "id": "P250", "mv": 1.0 }).as_object().unwrap());  // leaves
+            c.upsert("P260", json!({ "id": "P260", "mv": 500.0 }).as_object().unwrap()); // stays, moves
+            c.delete("P270");                                                            // leaves
+            c.end_batch();
+        }
+        let (from_patch, total_patch) = patched.read_window(0, None);
+        assert_eq!(patched.order_patches(), 1, "this must be the patch path");
+
+        // A view opened fresh at the same revision can only rebuild.
+        let mut rebuilt = view(cache.clone(), spec);
+        let (from_rebuild, total_rebuild) = rebuilt.read_window(0, None);
+        assert_eq!(rebuilt.order_patches(), 0);
+
+        assert_eq!(total_patch, total_rebuild, "row counts must agree");
+        assert_eq!(from_patch, from_rebuild, "patched order must equal a rebuilt one");
+    }
+
+    #[test]
+    fn falling_past_the_touch_log_rebuilds_rather_than_patching_wrongly() {
+        let cache = cache_with(50);
+        cache.lock().unwrap().set_touch_log_cap(2);
+        let mut v = view(cache.clone(), json!({ "sort": [{ "column": "mv", "sort": "asc" }] }));
+        v.read_window(0, Some(5));
+        assert_eq!(v.order_builds(), 1);
+
+        // Three separate revisions with a two-entry log: the view's revision is
+        // no longer reachable, so a patch would be applied against an incomplete
+        // change set. It must rebuild instead.
+        for i in 0..3 {
+            let mut c = cache.lock().unwrap();
+            c.begin_batch();
+            c.upsert(&format!("P{i}"), json!({ "id": format!("P{i}"), "mv": 900.0 + i as f64 })
+                .as_object().unwrap());
+            c.end_batch();
+        }
+        v.read_window(0, Some(5));
+        assert_eq!(v.order_builds(), 2, "must rebuild, not patch from a pruned log");
+        assert_eq!(v.order_patches(), 0);
+    }
+
+    #[test]
+    fn a_large_change_rebuilds_rather_than_patching() {
+        let cache = cache_with(100);
+        let mut v = view(cache.clone(), json!({ "sort": [{ "column": "mv", "sort": "asc" }] }));
+        v.read_window(0, Some(5));
+
+        // Touch most of the table — a patch would evaluate the predicate nearly
+        // as many times as a rebuild, and pay the bookkeeping on top.
+        {
+            let mut c = cache.lock().unwrap();
+            c.begin_batch();
+            for i in 0..90 {
+                c.upsert(&format!("P{i}"), json!({ "id": format!("P{i}"), "mv": i as f64 })
+                    .as_object().unwrap());
+            }
+            c.end_batch();
+        }
+        v.read_window(0, Some(5));
+        assert_eq!(v.order_builds(), 2);
+        assert_eq!(v.order_patches(), 0);
     }
 
     #[test]

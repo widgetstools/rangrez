@@ -257,12 +257,22 @@ pub fn compare_values(a: &Value, b: &Value) -> Ordering {
 
 fn num(v: &Value) -> f64 { match v { Value::Int(i) => *i as f64, Value::Float(f) => *f, _ => f64::NAN } }
 
+/// Does one slot pass the filter?
+///
+/// Extracted so the full scan below and the incremental view patch evaluate the
+/// predicate through the SAME code. Two implementations of "is this row in the
+/// view" that disagree on one operator produce a view that is right after a
+/// rebuild and wrong after a patch — an inconsistency that would surface as rows
+/// appearing and disappearing as the feed ticks, with nothing to point at.
+pub fn row_matches(cache: &TableCache, filter: &Filter, slot: usize) -> bool {
+    if filter.is_empty() { return true; }
+    let get = |col: &str| cache.col_index(col).map(|ci| cache.cell(slot, ci).clone()).unwrap_or(Value::Null);
+    filter.matches(&get)
+}
+
 /// The filtered set of live slots, in slot order.
 pub fn filtered_slots(cache: &TableCache, filter: &Filter) -> Vec<usize> {
-    cache.live_slots().filter(|&slot| {
-        let get = |col: &str| cache.col_index(col).map(|ci| cache.cell(slot, ci).clone()).unwrap_or(Value::Null);
-        filter.is_empty() || filter.matches(&get)
-    }).collect()
+    cache.live_slots().filter(|&slot| row_matches(cache, filter, slot)).collect()
 }
 
 /// Sort slots by a multi-column key. Stable, so equal keys keep slot order.

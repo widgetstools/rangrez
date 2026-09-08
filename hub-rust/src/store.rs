@@ -12,7 +12,7 @@
 //! delete tombstones the slot and frees it for reuse, so churn does not grow the
 //! backing vectors without bound.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use serde_json::Value as Json;
 
@@ -94,6 +94,21 @@ pub struct TableCache {
     // one at or above it sees none.
     batch_depth: u32,
     batch_dirty: bool,
+    // Which slots each recent revision touched, so a reader that is only a few
+    // revisions behind can patch what it holds instead of rebuilding it.
+    //
+    // `changed_since` answers the same question by scanning every slot's
+    // `slot_rev`, which is O(table) — fine for a delta stream that has to
+    // materialize the changed rows anyway, useless for a view trying to avoid an
+    // O(table) pass. This log makes "what moved" cost the size of the move.
+    //
+    // Bounded: past `touch_log_cap` revisions the oldest entries are dropped and
+    // a reader that far behind is told to rebuild. Keeping an unbounded history
+    // to spare an occasional rebuild would trade a bounded cost for an unbounded
+    // one.
+    touch_log: VecDeque<(u64, Vec<usize>)>,
+    touch_log_cap: usize,
+    batch_touched: Vec<usize>,
 }
 
 impl TableCache {
@@ -110,6 +125,7 @@ impl TableCache {
             rev: 0, slot_rev: Vec::new(), deletions: Vec::new(),
             deletions_cap: 100_000, deletions_floor: 0,
             batch_depth: 0, batch_dirty: false,
+            touch_log: VecDeque::new(), touch_log_cap: 64, batch_touched: Vec::new(),
         }
     }
 
@@ -122,7 +138,54 @@ impl TableCache {
     /// mutation outside any batch bumps as usual.
     pub fn end_batch(&mut self) {
         self.batch_depth = self.batch_depth.saturating_sub(1);
-        if self.batch_depth == 0 { self.batch_dirty = false; }
+        if self.batch_depth != 0 { return; }
+        if self.batch_dirty {
+            let touched = std::mem::take(&mut self.batch_touched);
+            let rev = self.rev;
+            self.push_touches(rev, touched);
+        }
+        self.batch_dirty = false;
+        self.batch_touched.clear();
+    }
+
+    /// Record that `slot` moved at `rev`. Inside a batch the touches accumulate
+    /// and land as one log entry when the batch closes, matching the one
+    /// revision the batch shares.
+    fn record_touch(&mut self, slot: usize, rev: u64) {
+        if self.batch_depth > 0 { self.batch_touched.push(slot); return; }
+        self.push_touches(rev, vec![slot]);
+    }
+
+    fn push_touches(&mut self, rev: u64, slots: Vec<usize>) {
+        self.touch_log.push_back((rev, slots));
+        while self.touch_log.len() > self.touch_log_cap { self.touch_log.pop_front(); }
+    }
+
+    /// Slots touched after `since`, or `None` when the log no longer reaches
+    /// that far back and the caller must rebuild from scratch.
+    ///
+    /// Revisions are contiguous, so the log can answer only if its oldest entry
+    /// is at or before `since + 1`. Returning `None` rather than a partial
+    /// answer is the point: a patch applied against an incomplete change set is
+    /// silently wrong, and silently wrong is what this whole path must not be.
+    pub fn touched_since(&self, since: u64) -> Option<Vec<usize>> {
+        if since == self.rev { return Some(Vec::new()); }
+        if since > self.rev { return None; }
+        let oldest = self.touch_log.front().map(|(r, _)| *r)?;
+        if oldest > since + 1 { return None; }
+        let mut out = Vec::new();
+        for (r, slots) in &self.touch_log {
+            if *r > since { out.extend_from_slice(slots); }
+        }
+        Some(out)
+    }
+
+    /// Test seam: shrink the touch log so the fall-behind path can be exercised.
+    pub fn set_touch_log_cap(&mut self, cap: usize) { self.touch_log_cap = cap.max(1); }
+
+    /// Whether a slot currently holds a live row.
+    pub fn is_live(&self, slot: usize) -> bool {
+        self.keys.get(slot).map_or(false, |k| k.is_some())
     }
 
     /// The revision to stamp on a mutation happening right now.
@@ -191,7 +254,9 @@ impl TableCache {
                 self.cols[ci][slot] = v;
             }
         }
-        self.slot_rev[slot] = self.next_rev();
+        let rev = self.next_rev();
+        self.slot_rev[slot] = rev;
+        self.record_touch(slot, rev);
         is_new
     }
 
@@ -204,6 +269,7 @@ impl TableCache {
         self.free.push(slot);
         self.live -= 1;
         let rev = self.next_rev();
+        self.record_touch(slot, rev);
         if let Some(rk) = rk { self.deletions.push((rev, rk)); }
         if self.deletions.len() > self.deletions_cap {
             let drop = self.deletions.len() - self.deletions_cap;
