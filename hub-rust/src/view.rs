@@ -22,6 +22,14 @@ pub struct ViewSpec {
     pub sort: Vec<SortKey>,
     pub group_cols: Vec<String>,
     pub aggs: Vec<AggSpec>,
+    /// Pivot columns. Each group's aggregates are split by the distinct values
+    /// of these columns, producing `<splitValue>|<aggColumn>` fields.
+    ///
+    /// Requires `groupBy`: a split with nothing to split WITHIN has no rows to
+    /// attach the columns to, and AG Grid only sends `pivotCols` alongside
+    /// `rowGroupCols`. Ignored on a flat view rather than erroring, matching how
+    /// the rest of the spec treats fields it cannot use.
+    pub split_cols: Vec<String>,
 }
 
 impl ViewSpec {
@@ -49,7 +57,10 @@ impl ViewSpec {
             },
             _ => {}
         }
-        ViewSpec { filter, sort, group_cols, aggs }
+        let split_cols = spec.get("splitBy").and_then(Json::as_array)
+            .map(|a| a.iter().filter_map(|c| c.as_str().map(str::to_string)).collect())
+            .unwrap_or_default();
+        ViewSpec { filter, sort, group_cols, aggs, split_cols }
     }
 }
 
@@ -272,7 +283,11 @@ impl View {
             let mut gpath = path.to_vec();
             gpath.push(group_key_string(&value));
             let expanded = self.expanded.contains(&gpath);
-            let aggregates = aggregate_over(cache, &member_slots, &self.spec.aggs);
+            let aggregates = if self.spec.split_cols.is_empty() {
+                aggregate_over(cache, &member_slots, &self.spec.aggs)
+            } else {
+                self.aggregate_split(cache, &member_slots)
+            };
             out.push(group_row_json(group_col, &value, member_slots.len(), &aggregates, level, expanded, &gpath));
             if expanded {
                 if level + 1 < self.spec.group_cols.len() {
@@ -284,6 +299,44 @@ impl View {
                 }
             }
         }
+    }
+
+    /// One group's aggregates, split by the pivot columns.
+    ///
+    /// Names are `<splitValue>|<aggColumn>` — e.g. `USD|marketValue`. The
+    /// separator is `|` because that is what AG Grid is told to split on via
+    /// `serverSidePivotResultFieldSeparator`, and what the client's
+    /// `pivotResultFields` scan looks for; changing it here silently produces a
+    /// grid with correct data and no pivot columns.
+    ///
+    /// Buckets are emitted in sorted key order so a given pivot yields the same
+    /// column order on every read. Without that, two reads of the same view
+    /// could hand AG Grid its secondary columns in different orders and the
+    /// grid would rebuild them mid-scroll.
+    fn aggregate_split(
+        &self,
+        cache: &TableCache,
+        slots: &[usize],
+    ) -> indexmap::IndexMap<String, Value> {
+        let idx: Vec<Option<usize>> =
+            self.spec.split_cols.iter().map(|c| cache.col_index(c)).collect();
+        let mut buckets: indexmap::IndexMap<String, Vec<usize>> = indexmap::IndexMap::new();
+        for &slot in slots {
+            let key = idx.iter()
+                .map(|ci| ci.map(|ci| split_key_string(cache.cell(slot, ci))).unwrap_or_default())
+                .collect::<Vec<_>>()
+                .join("|");
+            buckets.entry(key).or_default().push(slot);
+        }
+        buckets.sort_keys();
+
+        let mut out = indexmap::IndexMap::new();
+        for (key, member_slots) in buckets {
+            for (name, value) in aggregate_over(cache, &member_slots, &self.spec.aggs) {
+                out.insert(format!("{key}|{name}"), value);
+            }
+        }
+        out
     }
 
     pub fn num_rows(&mut self) -> usize {
@@ -353,6 +406,22 @@ impl View {
         // would keep serving the tree shape from before the expansion.
         self.expand_gen += 1;
         Ok(self.num_rows())
+    }
+}
+
+/// A pivot column-name fragment: the CLEAN value, not the type-tagged group key.
+///
+/// `group_key_string` prefixes a type tag so that the string "1" and the number
+/// 1 cannot collide in a group path. A pivot key is a user-visible column name,
+/// where that tag would surface as `sUSD|marketValue` in the grid header.
+fn split_key_string(v: &Value) -> String {
+    match v {
+        Value::Null => "null".to_string(),
+        Value::Str(s) => s.to_string(),
+        other => match other.to_json() {
+            Json::String(s) => s,
+            j => j.to_string(),
+        },
     }
 }
 
@@ -536,6 +605,60 @@ mod memo_tests {
         v.read_window(0, Some(5));
         assert_eq!(v.order_builds(), 2);
         assert_eq!(v.order_patches(), 0);
+    }
+
+    #[test]
+    fn pivot_splits_each_group_aggregate_by_the_split_column() {
+        let mut c = TableCache::new(["id", "desk", "ccy", "mv"]);
+        c.begin_batch();
+        for (id, desk, ccy, mv) in [
+            ("1", "govies", "USD", 100.0), ("2", "govies", "EUR", 200.0),
+            ("3", "credit", "USD", 400.0), ("4", "credit", "EUR", 800.0),
+            ("5", "credit", "USD", 1.0),
+        ] {
+            c.upsert(id, json!({ "id": id, "desk": desk, "ccy": ccy, "mv": mv })
+                .as_object().unwrap());
+        }
+        c.end_batch();
+        let cache = Arc::new(Mutex::new(c));
+
+        let mut v = view(cache, json!({
+            "groupBy": ["desk"], "splitBy": ["ccy"], "aggregates": { "mv": "sum" },
+        }));
+        let (rows, _) = v.read_window(0, None);
+        let credit = rows.iter().find(|r| r["desk"] == json!("credit")).expect("credit group");
+        let govies = rows.iter().find(|r| r["desk"] == json!("govies")).expect("govies group");
+
+        // The whole point: 400 + 1 and 800 stay APART instead of collapsing to 1201.
+        assert_eq!(credit["USD|mv"], json!(401.0));
+        assert_eq!(credit["EUR|mv"], json!(800.0));
+        assert_eq!(govies["USD|mv"], json!(100.0));
+        assert_eq!(govies["EUR|mv"], json!(200.0));
+
+        // The separator must be the one AG Grid is told to split on.
+        assert!(credit.as_object().unwrap().keys().any(|k| k.contains('|')));
+    }
+
+    #[test]
+    fn pivot_column_order_is_stable_across_reads() {
+        let cache = cache_with(60);
+        let mut v = view(cache, json!({
+            "groupBy": ["desk"], "splitBy": ["id"], "aggregates": { "mv": "sum" },
+        }));
+        let first: Vec<String> = v.read_window(0, None).0[0].as_object().unwrap()
+            .keys().cloned().collect();
+        let second: Vec<String> = v.read_window(0, None).0[0].as_object().unwrap()
+            .keys().cloned().collect();
+        assert_eq!(first, second, "unstable column order rebuilds AG Grid's secondary columns");
+    }
+
+    #[test]
+    fn a_view_without_split_by_is_untouched_by_pivot_support() {
+        let cache = cache_with(20);
+        let mut v = view(cache, json!({ "groupBy": ["desk"], "aggregates": { "mv": "sum" } }));
+        let (rows, _) = v.read_window(0, None);
+        assert!(rows[0].get("mv").is_some(), "plain aggregate stays plain");
+        assert!(!rows[0].as_object().unwrap().keys().any(|k| k.contains('|')));
     }
 
     #[test]
