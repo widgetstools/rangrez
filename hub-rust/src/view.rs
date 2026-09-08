@@ -57,24 +57,65 @@ pub struct View {
     pub spec: ViewSpec,
     pub session_id: String,
     expanded: HashSet<Vec<String>>,
+    /// The view's slot order, valid ONLY for the cache revision it was built at.
+    ///
+    /// Every read used to re-run `filtered_slots` over the whole table and, for a
+    /// flat view, re-sort it. That cost does not shrink with a selective filter —
+    /// the scan is over every live slot regardless — so a blotter scrolling
+    /// through blocks paid a full-table pass per block, and ten blotters paid ten.
+    /// Now the work happens once per revision and every read inside it is a slice.
+    ///
+    /// This only became possible once ingest started batching revisions: while
+    /// `rev` advanced per row, a memo stamped with it was stale before it could
+    /// be read twice.
+    memo: Option<SlotMemo>,
+}
+
+/// A materialized slot order plus the revision that produced it.
+struct SlotMemo {
+    revision: u64,
+    /// Filtered slots; additionally sorted when the view is flat (a grouped view
+    /// sorts leaves within each group, so the pre-group order is irrelevant).
+    slots: Vec<usize>,
 }
 
 impl View {
     pub fn new(cache: Arc<Mutex<TableCache>>, spec: ViewSpec, session_id: String) -> View {
-        View { cache, spec, session_id, expanded: HashSet::new() }
+        View { cache, spec, session_id, expanded: HashSet::new(), memo: None }
     }
 
+    /// Rebuild the slot order if the cache has moved since it was built.
+    ///
+    /// Deliberately keyed on revision alone, not on expansion state: expanding a
+    /// group changes which rows are VISIBLE, never which rows pass the filter.
+    fn refresh_memo(&mut self, cache: &TableCache) {
+        let revision = cache.revision();
+        if matches!(&self.memo, Some(m) if m.revision == revision) { return; }
+        let mut slots = filtered_slots(cache, &self.spec.filter);
+        if self.spec.group_cols.is_empty() {
+            sort_slots(cache, &mut slots, &self.spec.sort);
+        }
+        self.memo = Some(SlotMemo { revision, slots });
+    }
+
+    /// The memoized slot order. Call `refresh_memo` first.
+    fn slots(&self) -> &[usize] {
+        self.memo.as_ref().map(|m| m.slots.as_slice()).unwrap_or(&[])
+    }
+
+    /// Number of times the order was rebuilt — diagnostics for the memo's value.
+    pub fn memo_revision(&self) -> Option<u64> { self.memo.as_ref().map(|m| m.revision) }
+
     /// The flattened visible rows (group rows + leaves under expanded nodes).
-    fn flatten(&self) -> Vec<Json> {
-        let cache = self.cache.lock().unwrap();
-        let slots = filtered_slots(&cache, &self.spec.filter);
+    fn flatten(&mut self) -> Vec<Json> {
+        let cache_arc = self.cache.clone();
+        let cache = cache_arc.lock().unwrap();
+        self.refresh_memo(&cache);
         let mut out = Vec::new();
         if self.spec.group_cols.is_empty() {
-            let mut leaves = slots;
-            sort_slots(&cache, &mut leaves, &self.spec.sort);
-            for s in leaves { if let Some(r) = cache.row_json(s) { out.push(r); } }
+            for &s in self.slots() { if let Some(r) = cache.row_json(s) { out.push(r); } }
         } else {
-            self.emit_level(&cache, &slots, &[], 0, &mut out);
+            self.emit_level(&cache, self.slots(), &[], 0, &mut out);
         }
         out
     }
@@ -107,12 +148,14 @@ impl View {
         }
     }
 
-    pub fn num_rows(&self) -> usize {
+    pub fn num_rows(&mut self) -> usize {
         // A flat view's row count is just its filtered slot count — building JSON
         // for every row only to count them is the same waste `read_window` avoids.
         if self.spec.group_cols.is_empty() {
-            let cache = self.cache.lock().unwrap();
-            return filtered_slots(&cache, &self.spec.filter).len();
+            let cache_arc = self.cache.clone();
+            let cache = cache_arc.lock().unwrap();
+            self.refresh_memo(&cache);
+            return self.slots().len();
         }
         self.flatten().len()
     }
@@ -123,13 +166,13 @@ impl View {
     /// The sort operates on slot INDICES, not rows, so reading rows `[s,e)` of a
     /// 500k table builds `e-s` row objects, not 500k — window read is the hot SSRM
     /// path and must be O(window), not O(table).
-    pub fn read_window(&self, start: usize, end: Option<usize>) -> (Vec<Json>, usize) {
-        let cache = self.cache.lock().unwrap();
-        let slots = filtered_slots(&cache, &self.spec.filter);
+    pub fn read_window(&mut self, start: usize, end: Option<usize>) -> (Vec<Json>, usize) {
+        let cache_arc = self.cache.clone();
+        let cache = cache_arc.lock().unwrap();
+        self.refresh_memo(&cache);
 
         if self.spec.group_cols.is_empty() {
-            let mut leaves = slots;
-            sort_slots(&cache, &mut leaves, &self.spec.sort);
+            let leaves = self.slots();
             let total = leaves.len();
             let e = end.unwrap_or(total).min(total);
             let s = start.min(e);
@@ -140,7 +183,7 @@ impl View {
         // Grouped/tree view: the flattened tree is small (group rows + leaves under
         // expanded nodes only), so materialize it and slice.
         let mut out = Vec::new();
-        self.emit_level(&cache, &slots, &[], 0, &mut out);
+        self.emit_level(&cache, self.slots(), &[], 0, &mut out);
         let total = out.len();
         let e = end.unwrap_or(total).min(total);
         let s = start.min(e);
@@ -179,4 +222,99 @@ fn group_row_json(col: &str, value: &Value, count: usize, aggregates: &indexmap:
     o.insert(col.to_string(), value.to_json());
     for (k, v) in aggregates { o.insert(k.clone(), v.to_json()); }
     Json::Object(o)
+}
+
+#[cfg(test)]
+mod memo_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn cache_with(rows: usize) -> Arc<Mutex<TableCache>> {
+        let mut c = TableCache::new(["id", "desk", "mv"]);
+        c.begin_batch();
+        for i in 0..rows {
+            let desk = if i % 2 == 0 { "govies" } else { "credit" };
+            c.upsert(&format!("P{i}"), json!({ "id": format!("P{i}"), "desk": desk, "mv": i })
+                .as_object().unwrap());
+        }
+        c.end_batch();
+        Arc::new(Mutex::new(c))
+    }
+
+    fn view(cache: Arc<Mutex<TableCache>>, spec: Json) -> View {
+        View::new(cache, ViewSpec::from_json(&spec), "s1".into())
+    }
+
+    #[test]
+    fn repeated_window_reads_reuse_one_order() {
+        let cache = cache_with(50);
+        let mut v = view(cache, json!({ "sort": [{ "column": "mv", "sort": "desc" }] }));
+
+        v.read_window(0, Some(10));
+        let built_at = v.memo_revision().expect("order built on first read");
+
+        // Every later read inside the same revision must reuse it — this is the
+        // block-scroll path, where AG Grid issues many reads per revision.
+        for start in [10, 20, 30, 40] { v.read_window(start, Some(start + 10)); }
+        assert_eq!(v.memo_revision(), Some(built_at));
+    }
+
+    #[test]
+    fn an_ingest_batch_invalidates_the_order_exactly_once() {
+        let cache = cache_with(50);
+        let mut v = view(cache.clone(), json!({ "sort": [{ "column": "mv", "sort": "asc" }] }));
+        v.read_window(0, Some(10));
+        let before = v.memo_revision().unwrap();
+
+        // A 20-row batch is ONE revision, so it strands the order once, not 20 times.
+        {
+            let mut c = cache.lock().unwrap();
+            c.begin_batch();
+            for i in 0..20 {
+                c.upsert(&format!("P{i}"), json!({ "id": format!("P{i}"), "mv": 1000 + i })
+                    .as_object().unwrap());
+            }
+            c.end_batch();
+        }
+        v.read_window(0, Some(10));
+        assert_eq!(v.memo_revision(), Some(before + 1));
+    }
+
+    #[test]
+    fn a_rebuilt_order_reflects_the_new_data() {
+        let cache = cache_with(10);
+        let mut v = view(cache.clone(), json!({ "sort": [{ "column": "mv", "sort": "desc" }] }));
+        let (rows, _) = v.read_window(0, Some(1));
+        assert_eq!(rows[0]["mv"], json!(9));
+
+        // A stale memo would keep answering 9 here.
+        cache.lock().unwrap().upsert("P0", json!({ "id": "P0", "mv": 99 }).as_object().unwrap());
+        let (rows, _) = v.read_window(0, Some(1));
+        assert_eq!(rows[0]["mv"], json!(99), "memo must not survive the row that outranks its head");
+    }
+
+    #[test]
+    fn expanding_a_group_does_not_rebuild_the_order() {
+        let cache = cache_with(20);
+        let mut v = view(cache, json!({ "groupBy": ["desk"], "aggregates": { "mv": "sum" } }));
+        v.read_window(0, None);
+        let built_at = v.memo_revision().unwrap();
+
+        // Expansion changes which rows are VISIBLE, never which pass the filter.
+        v.set_expanded(0, false).expect("group row expands");
+        v.read_window(0, None);
+        assert_eq!(v.memo_revision(), Some(built_at));
+    }
+
+    #[test]
+    fn a_filtered_view_memoizes_only_its_own_rows() {
+        let cache = cache_with(20);
+        let mut v = view(cache, json!({
+            "filter": [{ "column": "desk", "op": "equals", "value": "govies" }],
+            "sort": [{ "column": "mv", "sort": "asc" }],
+        }));
+        let (_, total) = v.read_window(0, Some(5));
+        assert_eq!(total, 10, "half the rows are govies");
+        assert_eq!(v.slots().len(), 10, "the memo holds the filtered set, not the table");
+    }
 }

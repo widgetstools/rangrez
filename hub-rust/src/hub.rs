@@ -53,8 +53,8 @@ impl Hub {
         Ok(view_id)
     }
 
-    pub fn read_window(&self, view_id: &str, start: usize, end: Option<usize>) -> Result<(Vec<Json>, usize), String> {
-        let v = self.views.get(view_id).ok_or_else(|| format!("view \"{view_id}\" is not open"))?;
+    pub fn read_window(&mut self, view_id: &str, start: usize, end: Option<usize>) -> Result<(Vec<Json>, usize), String> {
+        let v = self.views.get_mut(view_id).ok_or_else(|| format!("view \"{view_id}\" is not open"))?;
         Ok(v.read_window(start, end))
     }
 
