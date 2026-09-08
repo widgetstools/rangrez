@@ -142,6 +142,11 @@ pub fn apply_message(cache: &mut TableCache, ds: &Datasource, raw: &Json) -> (us
     let mut ups = 0;
     let mut dels = 0;
 
+    // One upstream message is ONE revision, however many rows it carries. A
+    // 1000-row STOMP batch used to advance the revision 1000 times, which left
+    // no window in which the cache held still long enough for a downstream
+    // memo or materialized view order to be reused.
+    cache.begin_batch();
     for row in body_to_rows(raw, body_shape) {
         let Some(obj) = row.as_object() else { continue; };
         let Some(key) = encode_key(obj, &ds.key_columns) else { continue; };
@@ -165,6 +170,7 @@ pub fn apply_message(cache: &mut TableCache, ds: &Datasource, raw: &Json) -> (us
             }
         }
     }
+    cache.end_batch();
     (ups, dels)
 }
 

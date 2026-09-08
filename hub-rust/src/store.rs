@@ -81,6 +81,19 @@ pub struct TableCache {
     // subscriber can no longer trust it saw every delete — and must re-snapshot.
     deletions_cap: usize,
     deletions_floor: u64,
+    // Batched revisions. Outside a batch every change bumps `rev` by one, which
+    // is correct but makes the revision a per-ROW counter: at 10k updates/sec it
+    // advances 10k times a second, and anything keyed on "still revision R" —
+    // a query memo, a materialized view order — is stranded before it can be
+    // read twice. Inside a batch every change shares ONE revision, assigned
+    // lazily on the first actual mutation, so a 1000-row ingest advances the
+    // revision once and the cache is quiescent between batches.
+    //
+    // Delta semantics are unchanged: `changed_since` selects `slot_rev > since`,
+    // so a subscriber below the batch revision still sees every row in it, and
+    // one at or above it sees none.
+    batch_depth: u32,
+    batch_dirty: bool,
 }
 
 impl TableCache {
@@ -96,7 +109,34 @@ impl TableCache {
             free: Vec::new(), interner: HashMap::new(), live: 0,
             rev: 0, slot_rev: Vec::new(), deletions: Vec::new(),
             deletions_cap: 100_000, deletions_floor: 0,
+            batch_depth: 0, batch_dirty: false,
         }
+    }
+
+    /// Open a batch: every mutation until the matching `end_batch` shares one
+    /// revision. Re-entrant, so a caller that batches cannot be broken by an
+    /// inner one that also does.
+    pub fn begin_batch(&mut self) { self.batch_depth += 1; }
+
+    /// Close a batch. The revision assigned inside it stays put; the next
+    /// mutation outside any batch bumps as usual.
+    pub fn end_batch(&mut self) {
+        self.batch_depth = self.batch_depth.saturating_sub(1);
+        if self.batch_depth == 0 { self.batch_dirty = false; }
+    }
+
+    /// The revision to stamp on a mutation happening right now.
+    ///
+    /// Lazily assigned inside a batch: a batch that turns out to change nothing
+    /// must not advance the revision, or every no-op ingest would invalidate
+    /// every cache downstream for no reason.
+    fn next_rev(&mut self) -> u64 {
+        if self.batch_depth > 0 {
+            if !self.batch_dirty { self.rev += 1; self.batch_dirty = true; }
+        } else {
+            self.rev += 1;
+        }
+        self.rev
     }
 
     pub fn column_names(&self) -> &[Arc<str>] { &self.names }
@@ -151,8 +191,7 @@ impl TableCache {
                 self.cols[ci][slot] = v;
             }
         }
-        self.rev += 1;
-        self.slot_rev[slot] = self.rev;
+        self.slot_rev[slot] = self.next_rev();
         is_new
     }
 
@@ -164,8 +203,8 @@ impl TableCache {
         for c in &mut self.cols { c[slot] = Value::Null; }
         self.free.push(slot);
         self.live -= 1;
-        self.rev += 1;
-        if let Some(rk) = rk { self.deletions.push((self.rev, rk)); }
+        let rev = self.next_rev();
+        if let Some(rk) = rk { self.deletions.push((rev, rk)); }
         if self.deletions.len() > self.deletions_cap {
             let drop = self.deletions.len() - self.deletions_cap;
             // Everything at or below the newest dropped revision is now unknown.
@@ -182,7 +221,8 @@ impl TableCache {
     /// Test seam: shrink the deletion-log cap.
     pub fn set_deletions_cap(&mut self, cap: usize) { self.deletions_cap = cap.max(1); }
 
-    /// The current revision — every change bumps it by one.
+    /// The current revision. Outside a batch every change bumps it by one;
+    /// inside one, the whole batch shares a single revision.
     pub fn revision(&self) -> u64 { self.rev }
 
     /// What changed since `since`: live slots modified after it, and keys deleted
@@ -338,5 +378,77 @@ mod tests {
         t.upsert("P1", &fields(json!({"__key":"ignored","positionId":"P1","bogus":42})));
         assert_eq!(t.get("P1", "positionId"), Some(&Value::Str(Arc::from("P1"))));
         assert!(t.col_index("bogus").is_none());
+    }
+
+    #[test]
+    fn batch_shares_one_revision_across_every_row() {
+        let mut t = cache();
+        t.begin_batch();
+        for i in 0..100 {
+            t.upsert(&format!("P{i}"), &fields(json!({ "positionId": format!("P{i}"), "qty": i })));
+        }
+        t.end_batch();
+        // 100 rows, ONE revision — not 100.
+        assert_eq!(t.revision(), 1);
+
+        // And the delta is unaffected: a subscriber below the batch sees all of it.
+        let (slots, removals, rev) = t.changed_since(0);
+        assert_eq!(slots.len(), 100);
+        assert!(removals.is_empty());
+        assert_eq!(rev, 1);
+        // One at the batch revision sees none of it.
+        assert!(t.changed_since(1).0.is_empty());
+    }
+
+    #[test]
+    fn empty_batch_does_not_advance_the_revision() {
+        let mut t = cache();
+        t.upsert("P1", &fields(json!({ "positionId": "P1" })));
+        let before = t.revision();
+        t.begin_batch();
+        t.end_batch();
+        // A no-op ingest must not invalidate every downstream cache.
+        assert_eq!(t.revision(), before);
+    }
+
+    #[test]
+    fn nested_batches_still_collapse_to_one_revision() {
+        let mut t = cache();
+        t.begin_batch();
+        t.upsert("P1", &fields(json!({ "positionId": "P1" })));
+        t.begin_batch();
+        t.upsert("P2", &fields(json!({ "positionId": "P2" })));
+        t.end_batch();
+        // Still inside the outer batch — the inner close must not reopen bumping.
+        t.upsert("P3", &fields(json!({ "positionId": "P3" })));
+        t.end_batch();
+        assert_eq!(t.revision(), 1);
+        assert_eq!(t.changed_since(0).0.len(), 3);
+    }
+
+    #[test]
+    fn deletes_inside_a_batch_share_the_batch_revision() {
+        let mut t = cache();
+        t.upsert("P1", &fields(json!({ "positionId": "P1" })));
+        t.upsert("P2", &fields(json!({ "positionId": "P2" })));
+        let before = t.revision();
+
+        t.begin_batch();
+        t.upsert("P3", &fields(json!({ "positionId": "P3" })));
+        t.delete("P1");
+        t.end_batch();
+
+        assert_eq!(t.revision(), before + 1);
+        let (slots, removals, _) = t.changed_since(before);
+        assert_eq!(slots.len(), 1);              // P3 upserted
+        assert_eq!(removals, vec!["P1".to_string()]); // P1 removed, same revision
+    }
+
+    #[test]
+    fn outside_a_batch_every_change_still_bumps() {
+        let mut t = cache();
+        t.upsert("P1", &fields(json!({ "positionId": "P1" })));
+        t.upsert("P2", &fields(json!({ "positionId": "P2" })));
+        assert_eq!(t.revision(), 2);
     }
 }
