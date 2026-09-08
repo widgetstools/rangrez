@@ -69,6 +69,22 @@ pub struct View {
     /// `rev` advanced per row, a memo stamped with it was stale before it could
     /// be read twice.
     memo: Option<SlotMemo>,
+    /// The flattened group tree, valid for one (revision, expansion) pair.
+    ///
+    /// The slot memo removes the filter scan, but a grouped read still re-ran
+    /// `group_slots` and `aggregate_over` across every filtered row — so a
+    /// grouped blotter paid two full passes per block instead of one. AG Grid
+    /// reads several blocks of the same tree per revision, so building it once
+    /// and slicing is the same trade the slot memo makes one level down.
+    tree: Option<TreeMemo>,
+    /// Bumped by every expand/collapse, so the tree memo can tell "same data,
+    /// different shape" from "same shape, new data".
+    expand_gen: u64,
+    /// How many times each memo actually rebuilt. The revision alone cannot show
+    /// reuse - a rebuild at the same revision looks identical - so the counters
+    /// are what the tests assert on and what a diagnostics pane would report.
+    order_builds: u64,
+    tree_builds: u64,
 }
 
 /// A materialized slot order plus the revision that produced it.
@@ -79,9 +95,26 @@ struct SlotMemo {
     slots: Vec<usize>,
 }
 
+/// A materialized group tree plus the (revision, expansion) it was built for.
+struct TreeMemo {
+    revision: u64,
+    expand_gen: u64,
+    rows: Vec<Json>,
+}
+
+/// Above this many visible rows the tree is built transiently rather than kept.
+///
+/// A grouped read already materializes the whole flattened tree and slices it,
+/// so memoizing costs no extra peak. RETAINING it does: ten views each holding a
+/// fully expanded book is ten copies resident instead of one at a time. Past the
+/// cap the rebuild is cheaper than the residency, and a tree this large means
+/// nearly everything is expanded — which is the client-side row model's job.
+const TREE_MEMO_MAX_ROWS: usize = 50_000;
+
 impl View {
     pub fn new(cache: Arc<Mutex<TableCache>>, spec: ViewSpec, session_id: String) -> View {
-        View { cache, spec, session_id, expanded: HashSet::new(), memo: None }
+        View { cache, spec, session_id, expanded: HashSet::new(), memo: None, tree: None, expand_gen: 0,
+               order_builds: 0, tree_builds: 0 }
     }
 
     /// Rebuild the slot order if the cache has moved since it was built.
@@ -96,6 +129,7 @@ impl View {
             sort_slots(cache, &mut slots, &self.spec.sort);
         }
         self.memo = Some(SlotMemo { revision, slots });
+        self.order_builds += 1;
     }
 
     /// The memoized slot order. Call `refresh_memo` first.
@@ -106,18 +140,50 @@ impl View {
     /// Number of times the order was rebuilt — diagnostics for the memo's value.
     pub fn memo_revision(&self) -> Option<u64> { self.memo.as_ref().map(|m| m.revision) }
 
+    /// Whether the flattened tree is currently held. Diagnostics + tests.
+    pub fn tree_memo_revision(&self) -> Option<u64> { self.tree.as_ref().map(|t| t.revision) }
+
+    /// Times the slot order was rebuilt since this view opened.
+    pub fn order_builds(&self) -> u64 { self.order_builds }
+    /// Times the flattened tree was rebuilt since this view opened.
+    pub fn tree_builds(&self) -> u64 { self.tree_builds }
+
+    /// Rebuild the flattened tree if the data or the expansion state has moved.
+    ///
+    /// Returns `Some(rows)` when the tree was too large to keep — the caller uses
+    /// those rows directly — and `None` when it is held in `self.tree`. Splitting
+    /// it this way avoids building the tree twice in the over-cap case.
+    fn refresh_tree(&mut self, cache: &TableCache) -> Option<Vec<Json>> {
+        let revision = cache.revision();
+        if matches!(&self.tree, Some(t) if t.revision == revision && t.expand_gen == self.expand_gen) {
+            return None;
+        }
+        let mut rows = Vec::new();
+        self.emit_level(cache, self.slots(), &[], 0, &mut rows);
+        self.tree_builds += 1;
+        if rows.len() <= TREE_MEMO_MAX_ROWS {
+            self.tree = Some(TreeMemo { revision, expand_gen: self.expand_gen, rows });
+            None
+        } else {
+            self.tree = None;
+            Some(rows)
+        }
+    }
+
     /// The flattened visible rows (group rows + leaves under expanded nodes).
     fn flatten(&mut self) -> Vec<Json> {
         let cache_arc = self.cache.clone();
         let cache = cache_arc.lock().unwrap();
         self.refresh_memo(&cache);
-        let mut out = Vec::new();
         if self.spec.group_cols.is_empty() {
+            let mut out = Vec::new();
             for &s in self.slots() { if let Some(r) = cache.row_json(s) { out.push(r); } }
-        } else {
-            self.emit_level(&cache, self.slots(), &[], 0, &mut out);
+            return out;
         }
-        out
+        match self.refresh_tree(&cache) {
+            Some(rows) => rows,
+            None => self.tree.as_ref().map(|t| t.rows.clone()).unwrap_or_default(),
+        }
     }
 
     fn emit_level(&self, cache: &TableCache, slots: &[usize], path: &[String], level: usize, out: &mut Vec<Json>) {
@@ -180,14 +246,17 @@ impl View {
             return (rows, total);
         }
 
-        // Grouped/tree view: the flattened tree is small (group rows + leaves under
-        // expanded nodes only), so materialize it and slice.
-        let mut out = Vec::new();
-        self.emit_level(&cache, self.slots(), &[], 0, &mut out);
-        let total = out.len();
+        // Grouped/tree view: the flattened tree is group rows plus leaves under
+        // expanded nodes, built once per (revision, expansion) and sliced.
+        let transient = self.refresh_tree(&cache);
+        let rows: &[Json] = match transient.as_deref() {
+            Some(r) => r,
+            None => self.tree.as_ref().map(|t| t.rows.as_slice()).unwrap_or(&[]),
+        };
+        let total = rows.len();
         let e = end.unwrap_or(total).min(total);
         let s = start.min(e);
-        (out[s..e].to_vec(), total)
+        (rows[s..e].to_vec(), total)
     }
 
     /// Expand or collapse the group at a visible row index. Returns new row count.
@@ -208,6 +277,9 @@ impl View {
         } else {
             self.expanded.insert(path);
         }
+        // The tree memo is keyed on this: without the bump, expanding a group
+        // would keep serving the tree shape from before the expansion.
+        self.expand_gen += 1;
         Ok(self.num_rows())
     }
 }
@@ -291,6 +363,53 @@ mod memo_tests {
         cache.lock().unwrap().upsert("P0", json!({ "id": "P0", "mv": 99 }).as_object().unwrap());
         let (rows, _) = v.read_window(0, Some(1));
         assert_eq!(rows[0]["mv"], json!(99), "memo must not survive the row that outranks its head");
+    }
+
+    #[test]
+    fn grouped_reads_reuse_one_tree_within_a_revision() {
+        let cache = cache_with(200);
+        let mut v = view(cache, json!({ "groupBy": ["desk"], "aggregates": { "mv": "sum" } }));
+        v.read_window(0, Some(10));
+        assert_eq!(v.tree_builds(), 1);
+
+        // Grouping and aggregating used to run again on every one of these.
+        for start in [0, 2, 4, 6, 8] { v.read_window(start, Some(start + 2)); }
+        assert_eq!(v.tree_builds(), 1, "the tree must be built once per revision");
+        assert_eq!(v.order_builds(), 1, "and so must the slot order");
+    }
+
+    #[test]
+    fn expanding_a_group_rebuilds_the_tree_but_not_the_order() {
+        let cache = cache_with(20);
+        let mut v = view(cache, json!({ "groupBy": ["desk"], "aggregates": { "mv": "sum" } }));
+        let (before, _) = v.read_window(0, None);
+        assert_eq!(v.tree_builds(), 1);
+
+        v.set_expanded(0, false).expect("group row expands");
+        let (after, _) = v.read_window(0, None);
+
+        // Expansion changes the tree's SHAPE, so the tree must rebuild...
+        assert!(after.len() > before.len(), "expanding must reveal leaves");
+        assert!(v.tree_builds() > 1, "a stale tree would hide the expansion");
+        // ...but not which rows pass the filter, so the order must not.
+        assert_eq!(v.order_builds(), 1);
+    }
+
+    #[test]
+    fn new_data_rebuilds_the_tree_and_moves_the_aggregate() {
+        let cache = cache_with(10);
+        let mut v = view(cache.clone(), json!({ "groupBy": ["desk"], "aggregates": { "mv": "sum" } }));
+        let (rows, _) = v.read_window(0, None);
+        let credit_before = rows.iter()
+            .find(|r| r["desk"] == json!("credit")).expect("credit group")["mv"].clone();
+
+        cache.lock().unwrap()
+            .upsert("P1", json!({ "id": "P1", "desk": "credit", "mv": 10_000 }).as_object().unwrap());
+
+        let (rows, _) = v.read_window(0, None);
+        let credit_after = rows.iter()
+            .find(|r| r["desk"] == json!("credit")).expect("credit group")["mv"].clone();
+        assert_ne!(credit_before, credit_after, "a stale tree would serve the old sum");
     }
 
     #[test]
