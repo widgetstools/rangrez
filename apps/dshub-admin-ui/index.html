@@ -1,0 +1,625 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>DataSource Hub — admin</title>
+<!--
+  ONE entity, five tabs (user decision, 2026-09-03, after the stern editor):
+  Connection / Fields / Columns / Behaviour / Diagnostics. The storage model
+  keeps connection+datasource separate; splitEntity/mergeEntity hide that here.
+-->
+<style>
+  :root {
+    color-scheme: dark;
+    --bg:#14181d; --panel:#171b21; --line:#2b3138; --text:#e7eaed; --dim:#8a939c;
+    --accent:#e5a244; --ok:#7fd18a; --bad:#e8776a; --info:#7eb2d1; --primary:#2f81f7;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; font:13px ui-monospace,Menlo,monospace; background:var(--bg); color:var(--text);
+         display:grid; grid-template-columns:280px 1fr; grid-template-rows:1fr auto; height:100vh; }
+  /* ---------------- sidebar ---------------- */
+  aside { grid-row:1 / 3; border-right:1px solid var(--line); display:flex; flex-direction:column; }
+  aside header { padding:12px; display:flex; gap:8px; align-items:center; }
+  aside header h1 { font-size:13px; margin:0 auto 0 0; font-weight:600; }
+  #search { margin:0 12px 10px; }
+  #list { overflow:auto; flex:1; }
+  .row { padding:9px 12px; border-bottom:1px solid #1f242b; cursor:pointer; display:flex; align-items:center; gap:8px; }
+  .row.on { background:var(--panel); box-shadow:inset 2px 0 0 var(--primary); }
+  .row .nm { font-weight:600; }
+  .row .kd { color:var(--dim); font-size:11px; text-transform:uppercase; letter-spacing:.06em; }
+  .row .spacer { margin-left:auto; }
+  .row button { background:none; border:0; color:var(--dim); cursor:pointer; font:inherit; padding:2px 4px; }
+  .row button:hover { color:var(--bad); }
+  #newPick { display:none; padding:8px 12px; border-bottom:1px solid var(--line); gap:6px; flex-wrap:wrap; }
+  #newPick.open { display:flex; }
+  #newPick button { flex:1 0 40%; }
+  aside footer { padding:10px 12px; border-top:1px solid var(--line); display:flex; gap:10px; }
+  aside footer button { background:none; border:0; color:var(--info); cursor:pointer; font:inherit; padding:0; }
+  /* ---------------- main ---------------- */
+  main { overflow:auto; padding:16px 22px; }
+  #ident { display:flex; gap:14px; align-items:flex-end; margin-bottom:14px; }
+  #ident label { display:block; color:var(--dim); margin-bottom:4px; }
+  #ident .name { width:320px; }
+  nav { display:flex; gap:2px; border-bottom:1px solid var(--line); margin-bottom:16px; }
+  nav button { background:none; border:0; border-bottom:2px solid transparent; color:var(--dim);
+               padding:8px 14px; font:inherit; cursor:pointer; }
+  nav button.on { color:var(--text); border-bottom-color:var(--primary); }
+  section[hidden] { display:none; }
+  .card { border:1px solid var(--line); border-radius:5px; background:var(--panel); padding:14px 16px; margin-bottom:14px; max-width:860px; }
+  .card h3 { margin:0 0 12px; font-size:11px; font-weight:600; color:var(--dim); text-transform:uppercase; letter-spacing:.08em; }
+  .f { margin-bottom:14px; }
+  .f:last-child { margin-bottom:2px; }
+  .f > label { display:block; color:var(--dim); margin-bottom:5px; }
+  .f .req { color:var(--accent); }
+  .f .help { margin:5px 0 0; font-size:11px; color:var(--dim); line-height:1.45; max-width:72ch; }
+  input, select, textarea { background:#11151a; border:1px solid var(--line); color:var(--text);
+                            padding:6px 9px; font:inherit; border-radius:3px; width:100%; }
+  input[type=checkbox] { width:auto; }
+  details.adv { max-width:860px; margin:6px 0 14px; }
+  details.adv summary { color:var(--info); cursor:pointer; padding:4px 0; }
+  button.act { background:var(--panel); border:1px solid var(--line); color:var(--text);
+               padding:6px 13px; font:inherit; cursor:pointer; border-radius:3px; }
+  button.act:hover { border-color:var(--accent); }
+  button.primary { background:var(--primary); border-color:var(--primary); color:#fff; font-weight:600; }
+  button.primary:hover { filter:brightness(1.1); }
+  .msg { padding:8px 12px; border-radius:3px; margin:10px 0; white-space:pre-wrap; max-width:860px; }
+  .msg.err { background:#2a1614; color:var(--bad); }
+  .msg.ok  { background:#14261a; color:var(--ok); }
+  .msg.warn{ background:#2a2314; color:var(--accent); }
+  table { border-collapse:collapse; width:100%; }
+  th,td { text-align:left; padding:5px 10px 5px 0; border-bottom:1px solid #1f242b; }
+  th { color:var(--dim); font-weight:600; }
+  td input, td select { padding:3px 7px; }
+  .pill { font-size:10px; letter-spacing:.06em; text-transform:uppercase; padding:2px 7px; border-radius:9px;
+          border:1px solid var(--line); color:var(--dim); }
+  .pill.ok { color:var(--ok); border-color:#28503a; }
+  .pill.bad { color:var(--bad); border-color:#5a2c27; }
+  /* fields tab */
+  #fieldList { max-height:430px; overflow:auto; border:1px solid var(--line); border-radius:4px; }
+  .frow { display:flex; gap:10px; align-items:center; padding:6px 12px; border-bottom:1px solid #1f242b; }
+  .frow:hover { background:var(--panel); }
+  .frow .t { color:var(--dim); font-size:11px; }
+  .center { text-align:center; padding:70px 20px; color:var(--dim); }
+  .center b { color:var(--text); display:block; font-size:14px; margin-bottom:6px; }
+  /* footer */
+  #foot { grid-column:2; border-top:1px solid var(--line); padding:11px 22px; display:flex; gap:10px; align-items:center; }
+  #foot .hint { color:var(--dim); margin-right:auto; max-width:46ch; }
+  pre { color:var(--dim); font-size:11px; margin:8px 0; white-space:pre-wrap; }
+  .stat b { color:var(--text); font-weight:600; }
+  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:4px 30px; max-width:640px; }
+  .grid2 .k { color:var(--dim); }
+</style>
+
+<aside>
+  <header>
+    <h1>Datasources</h1>
+    <button class="act" id="import">Import</button>
+    <button class="act primary" id="new">+ New</button>
+  </header>
+  <div id="newPick">
+    <button class="act" data-kind="stomp">STOMP</button>
+    <button class="act" data-kind="ws">WebSocket</button>
+    <button class="act" data-kind="socketio">socket.io</button>
+    <button class="act" data-kind="rest">REST</button>
+  </div>
+  <input id="search" placeholder="Search…">
+  <div id="list"></div>
+  <footer>
+    <button id="exportAll">Export all</button>
+    <span style="color:var(--dim)" id="storeInfo"></span>
+  </footer>
+</aside>
+
+<main>
+  <div id="ident">
+    <div><label>Name <span class="req">*</span></label><input class="name" id="name" placeholder="e.g. positions"></div>
+    <span class="pill" id="kindPill">–</span>
+  </div>
+  <nav>
+    <button data-tab="connection" class="on">Connection</button>
+    <button data-tab="fields">Fields</button>
+    <button data-tab="columns">Columns</button>
+    <button data-tab="behaviour">Behaviour</button>
+    <button data-tab="diagnostics">Diagnostics</button>
+  </nav>
+
+  <section id="tab-connection">
+    <div id="connForm"></div>
+    <details class="adv"><summary>Advanced — all settings</summary><div id="connAdv"></div></details>
+    <div class="card" style="display:flex;align-items:center;gap:14px">
+      <span id="probeHint" style="color:var(--dim)">Not yet tested.</span>
+      <span style="margin-left:auto"></span>
+      <button class="act" id="test">Test Connection</button>
+    </div>
+    <div id="probeOut"></div>
+  </section>
+
+  <section id="tab-fields" hidden>
+    <div id="fieldsEmpty" class="center">
+      <b>No fields inferred yet</b>
+      Click <span style="color:var(--text)">Infer Fields</span> to fetch a sample snapshot and analyze the row schema.
+      <div style="margin-top:18px">
+        Sample size:
+        <select id="sample" style="width:auto;margin:0 10px">
+          <option>50</option><option selected>200</option><option>500</option>
+        </select>
+        <button class="act primary" id="infer">Infer Fields</button>
+      </div>
+    </div>
+    <div id="fieldsMain" hidden>
+      <div style="display:flex;gap:12px;align-items:center;margin-bottom:10px">
+        <span class="pill">inference</span>
+        <span class="stat"><b id="infRows">0</b> rows sampled · <b id="infFields">0</b> fields detected</span>
+        <span style="margin-left:auto"></span>
+        <span class="pill" id="selCount">0 selected</span>
+        <button class="act" id="resample">Re-sample</button>
+      </div>
+      <input id="fieldSearch" placeholder="Search fields…" style="margin-bottom:8px;max-width:860px">
+      <div class="frow" style="border:0"><input type="checkbox" id="selAll"><label for="selAll">Select all</label></div>
+      <div id="fieldList" style="max-width:860px"></div>
+      <div style="margin-top:10px"><button class="act primary" id="applyFields">Update Columns →</button></div>
+    </div>
+  </section>
+
+  <section id="tab-columns" hidden>
+    <div class="card">
+      <h3>Key column <span class="req">*</span></h3>
+      <div id="keyPick" style="display:flex;gap:6px;flex-wrap:wrap"></div>
+      <p class="help">Drives row identity (getRowId + the Perspective index). Pick one, or several for a composite key.</p>
+    </div>
+    <div class="card">
+      <h3>Columns (<span id="colCount">0</span>)</h3>
+      <div id="colsEmpty" class="center" style="padding:36px 10px">
+        <b>No columns selected</b>Pick fields on the Fields tab and they appear here as grid columns.
+      </div>
+      <table id="colTable" hidden>
+        <thead><tr><th>Field</th><th>Header</th><th>Type</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="tab-behaviour" hidden>
+    <div id="behForm"></div>
+    <details class="adv"><summary>Advanced — all settings</summary><div id="behAdv"></div></details>
+  </section>
+
+  <section id="tab-diagnostics" hidden>
+    <div class="card" style="display:flex;gap:12px;align-items:center">
+      <span class="pill" id="dstate">idle</span>
+      <span class="stat" id="dsub" style="color:var(--dim)">not subscribed</span>
+      <span style="margin-left:auto"></span>
+      <button class="act" id="dstart">Start</button>
+      <button class="act" id="dstop">Stop</button>
+    </div>
+    <div class="card"><h3>Live stats</h3><div class="grid2" id="dstats"><span class="k">–</span><span>–</span></div></div>
+  </section>
+
+  <div id="saveMsg"></div>
+</main>
+
+<div id="foot">
+  <span class="hint">Unsaved changes are kept locally until you click Save.</span>
+  <button class="act" id="cancel">Cancel</button>
+  <button class="act" id="export">Export</button>
+  <button class="act" id="dup">Duplicate</button>
+  <button class="act primary" id="save">Save DataSource</button>
+</div>
+
+<script type="module">
+import { openConfigStore } from '/packages/dshub-provider/src/configStore.mjs';
+import { exportBundle } from '/packages/dshub-provider/src/bundle.mjs';
+import { sectionsFor, readPath, writePath } from '/packages/dshub-admin/src/schemaForm.mjs';
+import { probeDatasource, defaultParams } from '/packages/dshub-admin/src/probe.mjs';
+import {
+  mergeEntity, splitEntity, newDraft, fieldIndex, resolveTabPaths,
+  CONNECTION_TAB, BEHAVIOUR_TAB, inferFields, columnsFromSelection,
+  buildArtifact, headerFor, exportEntity, importEntity,
+} from '/packages/dshub-admin/src/singleForm.mjs';
+
+const $ = (id) => document.getElementById(id);
+const schema = await (await fetch('/packages/dshub-spec/datasource-config.schema.json')).json();
+const store = openConfigStore({ schema });
+$('storeInfo').textContent = store.constructor.name === 'IdbConfigStore' ? 'IndexedDB' : 'memory';
+
+const state = {
+  list: [], selected: null,
+  draft: null, columns: [], keyColumns: [],
+  inferred: null, selectedFields: new Set(), probeCount: 0,
+};
+
+// ---------------------------------------------------------------- sidebar
+
+async function refreshList() {
+  const dss = await store.all('datasources');
+  const conns = new Map((await store.all('connections')).map((c) => [c.id, c]));
+  state.list = dss.map((d) => ({ ds: d, conn: conns.get(d.connectionRef) ?? { kind: '?' } }));
+  renderList();
+}
+
+function renderList() {
+  const q = $('search').value.toLowerCase();
+  const host = $('list'); host.innerHTML = '';
+  for (const { ds, conn } of state.list) {
+    if (q && !ds.id.toLowerCase().includes(q)) continue;
+    const row = document.createElement('div');
+    row.className = 'row' + (state.selected === ds.id ? ' on' : '');
+    row.innerHTML = `<div><div class="nm">${ds.id}</div><div class="kd">${conn.kind}</div></div>
+      <span class="spacer"></span><button title="delete">✕</button>`;
+    row.onclick = () => select(ds.id);
+    row.querySelector('button').onclick = async (e) => {
+      e.stopPropagation();
+      await store.delete('datasources', ds.id);
+      await store.delete('connections', ds.connectionRef);
+      if (ds.schemaRef) await store.delete('artifacts', ds.schemaRef);
+      if (state.selected === ds.id) { state.selected = null; state.draft = null; renderAll(); }
+      refreshList();
+    };
+    host.appendChild(row);
+  }
+}
+$('search').oninput = renderList;
+
+async function select(id) {
+  const ds = (await store.all('datasources')).find((d) => d.id === id);
+  if (!ds) return;
+  const conn = await store.get('connections', ds.connectionRef);
+  state.selected = id;
+  state.draft = mergeEntity(conn, ds);
+  state.keyColumns = [...(ds.keyColumns ?? [])];
+  state.inferred = null; state.selectedFields = new Set();
+  const artifact = ds.schemaRef ? await store.get('artifacts', ds.schemaRef) : null;
+  state.columns = (artifact?.columns ?? []).map((c) => ({
+    field: c.column, header: c.colDef?.headerName ?? headerFor(c.column),
+    type: c.type === 'float' || c.type === 'integer' ? 'number' : c.type === 'datetime' ? 'date' : c.type,
+  }));
+  renderAll(); renderList();
+}
+
+$('new').onclick = () => $('newPick').classList.toggle('open');
+for (const b of document.querySelectorAll('#newPick button')) {
+  b.onclick = () => {
+    $('newPick').classList.remove('open');
+    state.selected = null;
+    state.draft = newDraft(b.dataset.kind);
+    state.columns = []; state.keyColumns = [];
+    state.inferred = null; state.selectedFields = new Set();
+    renderAll(); renderList();
+    showTab('connection');
+  };
+}
+
+// ---------------------------------------------------------------- form rows
+
+/** One row from schema metadata — labels/help/enums are never invented here. */
+function rowFor(path, meta) {
+  const wrap = document.createElement('div');
+  wrap.className = 'f';
+  const label = document.createElement('label');
+  label.innerHTML = `${meta.label}${meta.required ? ' <span class="req">*</span>' : ''}`;
+  label.title = path;
+  wrap.appendChild(label);
+
+  let input;
+  if (meta.enum) {
+    input = document.createElement('select');
+    input.appendChild(new Option('', ''));
+    for (const o of meta.enum) input.appendChild(new Option(o, o));
+  } else if (meta.widget === 'checkbox') {
+    input = document.createElement('input'); input.type = 'checkbox';
+  } else {
+    input = document.createElement('input');
+    input.type = meta.widget === 'number' ? 'number' : 'text';
+  }
+  const p = path.split('.');
+  const v = readPath(state.draft, p);
+  if (meta.widget === 'checkbox') input.checked = v === true;
+  else input.value = v === undefined || v === null ? '' : (typeof v === 'object' ? JSON.stringify(v) : v);
+
+  input.oninput = () => {
+    let val = meta.widget === 'checkbox' ? input.checked
+      : meta.widget === 'number' ? (input.value === '' ? undefined : Number(input.value))
+      : input.value;
+    state.draft = writePath(state.draft, p, val);
+    if (meta.enum) renderCurated();          // a discriminator swap changes the field set
+  };
+  wrap.appendChild(input);
+  if (meta.description) {
+    const help = document.createElement('p');
+    help.className = 'help';
+    help.textContent = meta.description;
+    wrap.appendChild(help);
+  }
+  return wrap;
+}
+
+function renderCurated() {
+  const kind = state.draft?.connection?.kind ?? 'stomp';
+  $('kindPill').textContent = kind;
+  const idx = fieldIndex(state.draft ?? {}, schema);
+
+  const conn = $('connForm'); conn.innerHTML = '';
+  const card = document.createElement('div'); card.className = 'card';
+  card.innerHTML = '<h3>Connection</h3>';
+  for (const path of resolveTabPaths(CONNECTION_TAB[kind] ?? CONNECTION_TAB.stomp, idx)) {
+    card.appendChild(rowFor(path, idx.get(path)));
+  }
+  conn.appendChild(card);
+
+  const beh = $('behForm'); beh.innerHTML = '';
+  const bcard = document.createElement('div'); bcard.className = 'card';
+  bcard.innerHTML = '<h3>Batching & conflation</h3>';
+  for (const path of resolveTabPaths(BEHAVIOUR_TAB, idx)) bcard.appendChild(rowFor(path, idx.get(path)));
+  beh.appendChild(bcard);
+
+  renderAdvanced();
+}
+
+/** The full generated form, folded behind "Advanced" — nothing is unreachable. */
+function renderAdvanced() {
+  for (const [host, defName, part] of [
+    [$('connAdv'), 'connection', state.draft?.connection ?? {}],
+    [$('behAdv'), 'datasource', (() => { const { connection, ...d } = state.draft ?? {}; return d; })()],
+  ]) {
+    host.innerHTML = '';
+    for (const s of sectionsFor(defName, part, schema)) {
+      const c = document.createElement('div'); c.className = 'card';
+      c.innerHTML = `<h3>${s.label}</h3>`;
+      for (const f of [...s.visible, ...s.hidden]) {
+        const full = defName === 'connection' ? ['connection', ...f.path] : f.path;
+        c.appendChild(rowFor(full.join('.'), { ...f, path: full }));
+      }
+      host.appendChild(c);
+    }
+  }
+}
+
+// ---------------------------------------------------------------- probe
+
+let probeAbort = null;
+$('test').onclick = async () => {
+  if (!state.draft) return;
+  probeAbort?.abort(); probeAbort = new AbortController();
+  $('probeHint').textContent = 'probing… (10s timeout)';
+  $('probeOut').innerHTML = '';
+  const { connection, datasource } = splitEntity(state.draft);
+  const r = await probeDatasource({
+    connection, datasource, params: defaultParams(datasource),
+    maxRows: 5, timeoutMs: 10_000, signal: probeAbort.signal,
+  });
+  state.probeCount = r.rowCount;
+  $('probeHint').innerHTML = r.success
+    ? `<span style="color:var(--ok)">LIVE in ${r.tookMs}ms — ${r.rowCount.toLocaleString()} rows to the sentinel</span>`
+    : `<span style="color:var(--bad)">${r.error}</span>`;
+  $('probeOut').innerHTML =
+    `<pre>${r.states.map((s) => `${String(s.at).padStart(5)}ms  ${s.state}${s.detail ? ' — ' + s.detail : ''}`).join('\n')}</pre>`;
+};
+
+// ---------------------------------------------------------------- fields
+
+async function runInfer() {
+  if (!state.draft) return;
+  $('fieldsEmpty').querySelector('b').textContent = 'Sampling…';
+  const { connection, datasource } = splitEntity(state.draft);
+  const n = Number($('sample').value);
+  const r = await probeDatasource({
+    connection, datasource, params: defaultParams(datasource),
+    maxRows: n, timeoutMs: 15_000,
+  });
+  if (!r.rows.length) {
+    $('fieldsEmpty').querySelector('b').textContent = 'No fields inferred yet';
+    $('saveMsg').innerHTML = `<div class="msg err">inference: ${r.error ?? 'no rows arrived'}</div>`;
+    return;
+  }
+  state.inferred = inferFields(r.rows, datasource);
+  state.selectedFields = new Set(state.columns.map((c) => c.field));
+  $('infRows').textContent = r.rows.length.toLocaleString();
+  $('infFields').textContent = state.inferred.length;
+  $('fieldsEmpty').hidden = true; $('fieldsMain').hidden = false;
+  renderFieldList();
+}
+$('infer').onclick = runInfer;
+$('resample').onclick = runInfer;
+
+function renderFieldList() {
+  const q = $('fieldSearch').value.toLowerCase();
+  const host = $('fieldList'); host.innerHTML = '';
+  for (const f of state.inferred ?? []) {
+    if (q && !f.field.toLowerCase().includes(q)) continue;
+    const row = document.createElement('label');
+    row.className = 'frow';
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = state.selectedFields.has(f.field);
+    cb.onchange = () => {
+      cb.checked ? state.selectedFields.add(f.field) : state.selectedFields.delete(f.field);
+      $('selCount').textContent = `${state.selectedFields.size} selected`;
+    };
+    row.appendChild(cb);
+    row.insertAdjacentHTML('beforeend', `<span>${f.field}</span><span class="t">${f.type}</span>`);
+    host.appendChild(row);
+  }
+  $('selCount').textContent = `${state.selectedFields.size} selected`;
+}
+$('fieldSearch').oninput = renderFieldList;
+$('selAll').onchange = (e) => {
+  state.selectedFields = e.target.checked ? new Set((state.inferred ?? []).map((f) => f.field)) : new Set();
+  renderFieldList();
+};
+$('applyFields').onclick = () => {
+  state.columns = columnsFromSelection(state.inferred ?? [], state.selectedFields, state.columns)
+    .filter((c) => state.selectedFields.has(c.field));
+  if (!state.keyColumns.length) {
+    // A sensible default beats an empty required field: prefer an id-ish column.
+    const idish = state.columns.find((c) => /(^|_)id$/i.test(c.field) || /Id$/.test(c.field));
+    if (idish) state.keyColumns = [idish.field];
+  }
+  renderColumns(); showTab('columns');
+};
+
+// ---------------------------------------------------------------- columns
+
+function renderColumns() {
+  $('colCount').textContent = state.columns.length;
+  $('colsEmpty').hidden = state.columns.length > 0;
+  $('colTable').hidden = state.columns.length === 0;
+  const tb = $('colTable').querySelector('tbody'); tb.innerHTML = '';
+  for (const c of state.columns) {
+    const tr = document.createElement('tr');
+    const header = document.createElement('input'); header.value = c.header;
+    header.oninput = () => { c.header = header.value; };
+    const type = document.createElement('select');
+    for (const t of ['string', 'number', 'boolean', 'date']) type.appendChild(new Option(t, t));
+    type.value = c.type;
+    type.onchange = () => { c.type = type.value; };
+    const del = document.createElement('button'); del.className = 'act'; del.textContent = '✕';
+    del.onclick = () => { state.columns = state.columns.filter((x) => x !== c); state.keyColumns = state.keyColumns.filter((k) => k !== c.field); renderColumns(); };
+    tr.innerHTML = `<td>${c.field}</td>`;
+    for (const el of [header, type, del]) { const td = document.createElement('td'); td.appendChild(el); tr.appendChild(td); }
+    tb.appendChild(tr);
+  }
+  const kp = $('keyPick'); kp.innerHTML = '';
+  for (const c of state.columns) {
+    const b = document.createElement('button');
+    b.className = 'act'; b.textContent = c.field;
+    if (state.keyColumns.includes(c.field)) { b.style.borderColor = 'var(--primary)'; b.style.color = 'var(--primary)'; }
+    b.onclick = () => {
+      state.keyColumns = state.keyColumns.includes(c.field)
+        ? state.keyColumns.filter((k) => k !== c.field) : [...state.keyColumns, c.field];
+      renderColumns();
+    };
+    kp.appendChild(b);
+  }
+}
+
+// ---------------------------------------------------------------- save & co
+
+$('name').oninput = () => { if (state.draft) state.draft.id = $('name').value.trim(); };
+
+$('save').onclick = async () => {
+  if (!state.draft) return;
+  const msg = $('saveMsg');
+  try {
+    const id = state.draft.id;
+    if (!id) throw Object.assign(new Error('a datasource needs a name'), { code: 'config-invalid' });
+    state.draft.keyColumns = [...state.keyColumns];
+    state.draft.schemaRef = `${id}@v1`;
+    const { connection, datasource } = splitEntity(state.draft);
+    const artifact = buildArtifact(id, state.columns, state.keyColumns, { estimatedRows: state.probeCount });
+
+    // Connection first, so the ref check inside the datasource write passes.
+    await store.put('connections', connection.id, connection);
+    await store.put('datasources', datasource.id, datasource);
+    await store.put('artifacts', `${id}@v1`, artifact);
+    await store.assertRefs();
+
+    state.selected = id;
+    await refreshList();
+    msg.innerHTML = `<div class="msg ok">saved ${id} — ${state.columns.length} columns, key [${state.keyColumns.join(', ')}]. A blotter pointed at "${id}" will pick this up on next load.</div>`;
+  } catch (e) {
+    msg.innerHTML = `<div class="msg err">${e.message}${(e.errors ?? []).slice(1, 5).map((x) => `\n  ${x.path} ${x.message}`).join('')}</div>`;
+  }
+};
+
+$('cancel').onclick = () => { if (state.selected) select(state.selected); };
+$('dup').onclick = () => {
+  if (!state.draft) return;
+  state.draft = structuredClone(state.draft);
+  state.draft.id = `${state.draft.id}-copy`;
+  state.selected = null;
+  renderAll();
+};
+$('export').onclick = () => {
+  if (!state.draft) return;
+  const artifact = buildArtifact(state.draft.id || 'unnamed', state.columns, state.keyColumns);
+  download(`${state.draft.id || 'datasource'}.dshub.json`, JSON.stringify(exportEntity(state.draft, artifact), null, 2));
+};
+$('exportAll').onclick = async () => {
+  try { download('dshub-bundle.json', JSON.stringify(await exportBundle(store), null, 2)); }
+  catch (e) { $('saveMsg').innerHTML = `<div class="msg err">${e.message}</div>`; }
+};
+$('import').onclick = () => {
+  const inp = document.createElement('input'); inp.type = 'file'; inp.accept = '.json';
+  inp.onchange = async () => {
+    try {
+      const { draft, artifact } = importEntity(JSON.parse(await inp.files[0].text()));
+      state.draft = draft; state.selected = null;
+      state.keyColumns = [...(draft.keyColumns ?? [])];
+      state.columns = (artifact?.columns ?? []).map((c) => ({
+        field: c.column, header: c.colDef?.headerName ?? headerFor(c.column),
+        type: c.type === 'float' ? 'number' : c.type === 'datetime' ? 'date' : c.type,
+      }));
+      renderAll();
+    } catch (e) { $('saveMsg').innerHTML = `<div class="msg err">import: ${e.message}</div>`; }
+  };
+  inp.click();
+};
+
+function download(name, text) {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([text], { type: 'application/json' }));
+  a.download = name; a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+// ---------------------------------------------------------------- diagnostics
+
+let diag = null;
+$('dstart').onclick = async () => {
+  if (!state.draft?.id) return;
+  const { ControlClient } = await import('/packages/dshub-provider/src/control.mjs');
+  const { Transport } = await import('/packages/dshub-provider/src/transport.mjs');
+  const worker = new SharedWorker('/apps/dshub-spike/web/dshub.worker.mjs?v=admin', { type: 'module', name: 'dshub-admin' });
+  const control = new ControlClient({ send: (m) => transport.send(m), timeoutMs: 30_000 });
+  const transport = new Transport({
+    connect: () => worker.port,
+    onControl: (m) => { if (m.type === 'result' && m.payload?.ready) boot(); else control.handle(m); },
+  });
+  transport.open();
+  async function boot() {
+    try {
+      await control.hello({ appId: 'admin-diagnostics' });
+      const ref = { datasourceId: state.draft.id, params: defaultParams(state.draft) };
+      await control.subscribe(ref, { delivery: 'notify' });
+      control.on('state', (m) => { $('dstate').textContent = m.state; $('dstate').className = 'pill ' + (m.state === 'live' ? 'ok' : m.state === 'failed' ? 'bad' : ''); });
+      $('dsub').textContent = `subscribed as ${state.draft.id}`;
+      diag = setInterval(async () => {
+        const s = await control.request({ type: 'stats' }).catch(() => null);
+        const d = s?.payload?.datasources?.find((x) => x.datasourceId === state.draft.id) ?? s?.payload?.datasources?.[0];
+        if (!d) return;
+        $('dstats').innerHTML = Object.entries({
+          state: d.state, subscribers: d.subscribers, 'cache rows': d.cacheRows,
+          'msgs in': d.messagesIn ?? d.rowsIn, 'rows out': d.rowsOut ?? d.cacheRows,
+          rung: (d.subscriberRungs ?? []).join(',') || 'none', malformed: d.malformed ?? 0,
+          'engine bytes': s.payload.engine?.heap_size ? (s.payload.engine.heap_size / 1e6).toFixed(0) + ' MB' : '–',
+        }).map(([k, v]) => `<span class="k">${k}</span><span>${v ?? '–'}</span>`).join('');
+      }, 1000);
+      $('dstop').onclick = () => { clearInterval(diag); control.unsubscribe?.({ datasourceId: state.draft.id, params: defaultParams(state.draft) }); $('dstate').textContent = 'stopped'; $('dstate').className = 'pill'; };
+    } catch (e) {
+      $('dsub').textContent = String(e.message ?? e).slice(0, 120);
+      $('dstate').className = 'pill bad'; $('dstate').textContent = 'error';
+    }
+  }
+};
+
+// ---------------------------------------------------------------- tabs & render
+
+function showTab(name) {
+  for (const b of document.querySelectorAll('nav button')) b.classList.toggle('on', b.dataset.tab === name);
+  for (const s of ['connection', 'fields', 'columns', 'behaviour', 'diagnostics']) $(`tab-${s}`).hidden = s !== name;
+}
+for (const b of document.querySelectorAll('nav button')) b.onclick = () => showTab(b.dataset.tab);
+
+function renderAll() {
+  const has = !!state.draft;
+  $('name').value = state.draft?.id ?? '';
+  $('kindPill').textContent = state.draft?.connection?.kind ?? '–';
+  $('saveMsg').innerHTML = '';
+  $('probeOut').innerHTML = ''; $('probeHint').textContent = 'Not yet tested.';
+  $('fieldsEmpty').hidden = false; $('fieldsMain').hidden = true;
+  if (has) { renderCurated(); renderColumns(); }
+  else { $('connForm').innerHTML = '<div class="center"><b>No datasource selected</b>Pick one on the left, or create a new one.</div>'; }
+}
+
+await refreshList();
+if (state.list.length) select(state.list[0].ds.id); else renderAll();
+window.__admin = { store, state, refresh: refreshList };
+</script>

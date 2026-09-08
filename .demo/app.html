@@ -1,0 +1,252 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>AG-Grid SSRM → Rust DataSource Hub → STOMP view server</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; font: 13px ui-monospace, Menlo, monospace; background: #0e1216; color: #e7eaed; }
+  header { padding: 10px 16px; background: #14181d; border-bottom: 1px solid #2b3138; display: flex; gap: 18px; align-items: center; flex-wrap: wrap; }
+  header h1 { font-size: 14px; margin: 0; font-weight: 600; letter-spacing: .3px; }
+  header .sub { color: #8a939c; font-size: 11px; }
+  .stat { color: #8a939c; font-size: 12px; } .stat b { color: #e5a244; font-variant-numeric: tabular-nums; }
+  .badge { padding: 2px 8px; border-radius: 10px; font-size: 11px; }
+  .badge.loading { background: #3a2e12; color: #e5a244; } .badge.live { background: #12331c; color: #4ade80; }
+  .badge.err { background: #3a1414; color: #f87171; }
+  button { background: #1e242b; color: #e7eaed; border: 1px solid #2b3138; border-radius: 5px; padding: 4px 10px; font: inherit; cursor: pointer; }
+  button:hover { background: #262d35; }
+  #grid { height: calc(100vh - 52px); width: 100%; }
+</style>
+</head>
+<body>
+<header>
+  <h1>AG-Grid SSRM</h1>
+  <span class="sub">→ Rust hub <b>:8787</b> ⟶ STOMP view server <b>:8081</b></span>
+  <span id="state" class="badge loading">connecting…</span>
+  <span class="stat">rows <b id="rows">–</b></span>
+  <span class="stat">getRows <b id="reqs">0</b></span>
+  <span class="stat">openView <b id="views">0</b></span>
+  <span class="stat">block p50 <b id="p50">–</b></span>
+  <label class="stat"><input type="checkbox" id="auto" checked> auto-refresh</label>
+  <button id="refresh">refresh</button>
+</header>
+<div id="grid"></div>
+
+<script type="importmap">
+{
+  "imports": {
+    "ag-stack": "/node_modules/ag-stack/dist/package/main.esm.mjs",
+    "ag-grid-community": "/node_modules/ag-grid-community/dist/package/main.esm.mjs",
+    "ag-grid-enterprise": "/node_modules/ag-grid-enterprise/dist/package/main.esm.mjs"
+  }
+}
+</script>
+
+<script type="module">
+import { ModuleRegistry, createGrid, themeQuartz, colorSchemeDark, iconSetQuartzBold } from 'ag-grid-community';
+import { AllEnterpriseModule } from 'ag-grid-enterprise';
+import { Transport } from '/packages/dshub-provider/src/transport.mjs';
+import { ControlClient } from '/packages/dshub-provider/src/control.mjs';
+import { socketIoPort } from '/packages/dshub-provider/src/socketPort.mjs';
+
+ModuleRegistry.registerModules([AllEnterpriseModule]);
+
+const $ = (id) => document.getElementById(id);
+const setState = (s, cls) => { $('state').textContent = s; $('state').className = 'badge ' + cls; };
+const HUB = 'ws://127.0.0.1:8787';
+// The upstream STOMP view server (stern-bak), reached BY THE HUB — not the browser.
+const STOMP_URL = 'ws://127.0.0.1:8081';
+// params satisfy the trigger template /snapshot/positions/{clientId}/{rate}/{batchSize}
+const REF = { datasourceId: 'positions', params: { clientId: 'ssrm-app', rate: 2000, batchSize: 10 } };
+const state = { reqs: 0, views: 0, blockMs: [] };
+window.__demo = state;
+
+const control = new ControlClient({ send: (m) => transport.send(m), timeoutMs: 30_000 });
+const transport = new Transport({
+  connect: () => socketIoPort(HUB, { openSocket: (u) => new WebSocket(u) }),
+  onControl: (m) => control.handle(m),
+});
+transport.open();
+
+// AG-Grid SSRM getRows → Rust hub openView / readWindow / disposeView.
+function specFromRequest(req) {
+  const groupKeys = req.groupKeys ?? [];
+  const rowGroupCols = req.rowGroupCols ?? [];
+  const filter = groupKeys.map((value, i) => ({ column: rowGroupCols[i].id, op: 'equals', value }));
+  const spec = { filter, sort: (req.sortModel ?? []).map((s) => ({ colId: s.colId, sort: s.sort })) };
+  const next = rowGroupCols[groupKeys.length];
+  if (next) {
+    spec.groupBy = [next.id];
+    spec.aggregates = {};
+    for (const vc of req.valueCols ?? []) spec.aggregates[vc.field ?? vc.id] = vc.aggFunc ?? 'sum';
+  }
+  return spec;
+}
+
+const datasource = {
+  getRows: async (params) => {
+    const t0 = performance.now();
+    state.reqs++; $('reqs').textContent = state.reqs;
+    try {
+      const spec = specFromRequest(params.request);
+      const { payload: opened } = await control.request({ type: 'openView', ref: REF, view: spec });
+      state.views++; $('views').textContent = state.views;
+      const { payload } = await control.request({ type: 'readWindow', viewId: opened.viewId, startRow: params.request.startRow, endRow: params.request.endRow });
+      control.request({ type: 'disposeView', viewId: opened.viewId }).catch(() => {});
+      state.blockMs.push(performance.now() - t0);
+      const sorted = [...state.blockMs].sort((a, b) => a - b);
+      $('p50').textContent = sorted[sorted.length >> 1].toFixed(0) + 'ms';
+      params.success({ rowData: payload.rows, rowCount: payload.rowCount });
+    } catch (e) { console.error('getRows failed', e); params.fail(); }
+  },
+};
+
+const theme = themeQuartz.withPart(colorSchemeDark).withPart(iconSetQuartzBold).withParams({
+  backgroundColor: '#0e1216', foregroundColor: '#e7eaed', borderColor: '#2b3138',
+  headerBackgroundColor: '#14181d', headerTextColor: '#8a939c', oddRowBackgroundColor: '#12161b',
+  rowHoverColor: '#1a1f26', accentColor: '#e5a244',
+  fontFamily: 'ui-monospace, Menlo, monospace', fontSize: 12, headerFontSize: 11, rowHeight: 26, headerHeight: 30,
+});
+
+const num = (p) => (p.value == null ? '' : Number(p.value).toLocaleString(undefined, { maximumFractionDigits: 2 }));
+const GCOLS = ['desk', 'trader'];
+const gridApi = createGrid($('grid'), {
+  theme,
+  rowModelType: 'serverSide',
+  cacheBlockSize: 100,
+  // Stable ids so AG-Grid matches rows across refreshes and can flash the ones
+  // whose value moved (groups keyed by path, leaves by positionId).
+  getRowId: (p) => {
+    if (p.data && p.data.__group) {
+      const level = (p.parentKeys || []).length;          // 0=desk, 1=trader
+      return 'g:' + [...(p.parentKeys || []), p.data[GCOLS[level]]].join('\u0001');
+    }
+    return 'p:' + (p.data ? (p.data.__key ?? p.data.positionId) : '');
+  },
+  cellFlashDuration: 700,
+  cellFadeDuration: 500,
+  columnDefs: [
+    { field: 'desk', rowGroup: true, hide: true },
+    { field: 'trader', rowGroup: true, hide: true },
+    { field: 'bookName', headerName: 'Book', enableRowGroup: true, minWidth: 130 },
+    { field: 'instrumentType', headerName: 'Type', minWidth: 120 },
+    { field: 'positionId', headerName: 'Position', minWidth: 130 },
+    { field: 'marketValue', headerName: 'Mkt Value', aggFunc: 'sum', type: 'rightAligned', valueFormatter: num, enableCellChangeFlash: true },
+    { field: 'notionalAmount', headerName: 'Notional', aggFunc: 'sum', type: 'rightAligned', valueFormatter: num, enableCellChangeFlash: true },
+    { field: 'dv01', headerName: 'DV01', aggFunc: 'sum', type: 'rightAligned', valueFormatter: num, enableCellChangeFlash: true },
+    { field: 'currentPrice', headerName: 'Price', type: 'rightAligned', valueFormatter: num, enableCellChangeFlash: true },
+  ],
+  autoGroupColumnDef: { headerName: 'Desk / Trader', minWidth: 240, flex: 1 },
+  defaultColDef: { sortable: true, resizable: true, flex: 1, minWidth: 110 },
+  suppressAggFuncInHeader: true,
+});
+
+// boot: hello → bootstrap the hub with the STOMP view-server config → subscribe.
+(async () => {
+  try {
+    await control.request({ type: 'hello', appId: 'ssrm-demo-app', protocolVersion: 1 });
+    await control.request({ type: 'bootstrap', datasources: [{
+      id: 'positions', schemaRef: 'positions@v1', keyColumns: ['positionId'], estimatedRows: 20000,
+      columns: [
+        { name: 'positionId', type: 'string' }, { name: 'desk', type: 'string' }, { name: 'trader', type: 'string' },
+        { name: 'bookName', type: 'string' }, { name: 'instrumentType', type: 'string' }, { name: 'currency', type: 'string' },
+        { name: 'marketValue', type: 'integer' }, { name: 'notionalAmount', type: 'integer' }, { name: 'dv01', type: 'float' },
+        { name: 'currentPrice', type: 'float' }, { name: 'quantity', type: 'integer' }, { name: 'pnl', type: 'integer' },
+      ],
+      // How the HUB reaches the upstream STOMP view server (app-provided).
+      connection: { transport: 'stomp', url: STOMP_URL, vhost: 'localhost', heartbeat: { outMs: 1000, inMs: 10000 }, reconnect: { initialMs: 500, maxMs: 30000, factor: 2 } },
+      snapshot: {
+        mode: 'trigger-reply',
+        triggerDestination: '/snapshot/positions/{clientId}/{rate}/{batchSize}',
+        replyDestination: '/snapshot/positions/{clientId}',
+        endOfSnapshot: { kind: 'sentinel-header', header: 'message-type', value: 'snapshot-complete' },
+      },
+      updates: { destination: '/snapshot/positions/{clientId}', bodyShape: 'record-array' },
+    }] });
+    await control.request({ type: 'subscribe', ref: REF, delivery: 'rows' });
+
+    setState('loading snapshot…', 'loading');
+    const poll = async () => {
+      const rc = await control.request({ type: 'rowCount', ref: REF, view: { filter: [] } });
+      $('rows').textContent = Number(rc.payload).toLocaleString();
+      return rc.payload;
+    };
+    let n = 0, tries = 0;
+    do { await new Promise((r) => setTimeout(r, 400)); n = await poll(); } while (n === 0 && ++tries < 50);
+    setState(n > 0 ? 'live' : 'no data', n > 0 ? 'live' : 'err');
+    gridApi.setGridOption('serverSideDatasource', datasource);
+
+    // REAL-TIME: the hub watches the group tree and PUSHES a `groupDelta` the
+    // instant an aggregate moves (on its 100ms tick). We refresh the visible
+    // rows in place on each push — event-driven, not a fixed timer — so changed
+    // cells flash as the STOMP feed ticks. A short coalesce keeps a burst of
+    // deltas to one repaint.
+    await control.request({ type: 'watchGroups', ref: REF, groupBy: ['desk', 'trader'],
+      aggregates: { marketValue: 'sum', notionalAmount: 'sum', dv01: 'sum' } });
+    // Live value columns. When one is SORTED, a changed cell moves the row, so we
+    // must re-fetch the sorted blocks (a transaction only updates in place). When
+    // none is sorted, in-place transactions are enough — and cheaper.
+    const LIVE_COLS = ['marketValue', 'notionalAmount', 'dv01', 'currentPrice'];
+    const liveColumnSorted = () => gridApi.getColumnState().some((c) => c.sort && LIVE_COLS.includes(c.colId));
+    let refreshPending = false;
+    const scheduleRefresh = () => {
+      if (refreshPending) return;
+      refreshPending = true;
+      setTimeout(() => { refreshPending = false; gridApi.refreshServerSide({ purge: false }); }, 120);
+    };
+
+    // GROUP aggregates: push each moved group as an in-place transaction (pushed,
+    // not re-queried, like the Perspective engine). If a live column is sorted,
+    // re-fetch instead so the groups re-order.
+    control.on('groupDelta', (m) => {
+      // ACK the push so the hub's backpressure ladder sees us keeping up.
+      if (m.seq != null) transport.send({ type: 'ack', seq: m.seq });
+      if (!$('auto').checked) return;
+      if (liveColumnSorted()) { scheduleRefresh(); return; }
+      const byRoute = new Map();
+      for (const g of (m.groups || [])) {
+        const values = g.values || [];
+        if (!values.length) continue;
+        const level = values.length - 1;
+        const route = values.slice(0, level);
+        const row = { __group: true, __count: g.count, [GCOLS[level]]: values[level] };
+        Object.assign(row, g.aggregates);
+        const k = JSON.stringify(route);
+        if (!byRoute.has(k)) byRoute.set(k, { route, update: [] });
+        byRoute.get(k).update.push(row);
+      }
+      for (const { route, update } of byRoute.values()) {
+        try { gridApi.applyServerSideTransaction({ route, update }); } catch (e) { /* store not loaded */ }
+      }
+    });
+
+    // LEAF ticks: apply each changed row to its CURRENT group route — which is []
+    // when UNGROUPED, so a flat view ticks too. If a live column is sorted,
+    // re-fetch so rows move into their new sorted position.
+    control.on('rowDelta', (m) => {
+      if (m.seq != null) transport.send({ type: 'ack', seq: m.seq });
+      if (!$('auto').checked) return;
+      if (liveColumnSorted()) { scheduleRefresh(); return; }
+      const groupCols = gridApi.getRowGroupColumns().map((c) => c.getColId());
+      const byRoute = new Map();
+      for (const row of (m.upserts || [])) {
+        const route = groupCols.map((col) => row[col]);   // [] when ungrouped
+        const k = JSON.stringify(route);
+        if (!byRoute.has(k)) byRoute.set(k, { route, update: [] });
+        byRoute.get(k).update.push(row);
+      }
+      for (const { route, update } of byRoute.values()) {
+        try { gridApi.applyServerSideTransaction({ route, update }); } catch (e) { /* store not loaded */ }
+      }
+    });
+
+    // Slow header-only poll for the total row count (not the grid).
+    setInterval(poll, 2000);
+  } catch (e) { setState('error: ' + (e.message ?? e), 'err'); console.error(e); }
+})();
+
+window.__grid = gridApi;
+$('refresh').onclick = () => gridApi.refreshServerSide({ purge: true });
+</script>
+</body>
+</html>

@@ -1,0 +1,241 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>DataSource Hub — SSRM blotter</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin:0; font:13px ui-monospace,Menlo,monospace; background:#14181d; color:#e7eaed;
+         display:flex; flex-direction:column; height:100vh; }
+  header { padding:8px 14px; border-bottom:1px solid #2b3138; display:flex; gap:18px; align-items:center; flex-wrap:wrap; }
+  h1 { font-size:14px; margin:0; font-weight:600; }
+  .stat { color:#8a939c; } .stat b { color:#e7eaed; font-weight:600; }
+  .badge { padding:2px 8px; border-radius:2px; font-size:11px; letter-spacing:.08em; text-transform:uppercase; }
+  .live{background:#16321f;color:#7fd18a} .failed{background:#331c19;color:#e8776a} .loading{background:#1b2733;color:#7eb2d1}
+  #grid { flex:1; min-height:0; }
+</style>
+
+<header>
+  <h1>positions — SSRM</h1>
+  <span id="state" class="badge loading">connecting</span>
+  <span class="stat">server rows <b id="rows">–</b></span>
+  <span class="stat">getRows <b id="reqs">0</b></span>
+  <span class="stat">views open <b id="views">0</b></span>
+  <span class="stat">evicted <b id="evicted">0</b></span>
+  <span class="stat">block p50 <b id="p50">–</b></span>
+  <span class="stat">refreshes <b id="refreshes">0</b></span>
+  <input id="search" placeholder="quick filter…" style="background:#1a1e23;border:1px solid #2b3138;color:#e7eaed;padding:3px 8px;font:inherit;border-radius:2px">
+  <span class="stat" id="err" style="color:#e8776a"></span>
+</header>
+<div id="grid"></div>
+
+<script type="importmap">
+{
+  "imports": {
+    "ag-stack": "/node_modules/ag-stack/dist/package/main.esm.mjs",
+    "ag-grid-community": "/node_modules/ag-grid-community/dist/package/main.esm.mjs",
+    "ag-grid-enterprise": "/node_modules/ag-grid-enterprise/dist/package/main.esm.mjs"
+  }
+}
+</script>
+
+<script type="module">
+import { ModuleRegistry, createGrid, themeQuartz, colorSchemeDark, iconSetQuartzBold } from 'ag-grid-community';
+import { AllEnterpriseModule } from 'ag-grid-enterprise';
+import { buildColDefs } from '/packages/dshub-provider/src/coldefs.mjs';
+import { HubDataService } from '/packages/dshub-provider/src/hubDataService.mjs';
+import { SsrmMode } from '/packages/dshub-provider/src/modes/ssrm.mjs';
+import { attachCellSelection } from '/packages/dshub-provider/src/cellSelection.mjs';
+import { Transport } from '/packages/dshub-provider/src/transport.mjs';
+import { ControlClient } from '/packages/dshub-provider/src/control.mjs';
+
+// SSRM is Enterprise (ServerSideRowModelModule), as is the set filter the
+// artifact-driven colDefs emit.
+ModuleRegistry.registerModules([AllEnterpriseModule]);
+
+const $ = (id) => document.getElementById(id);
+const setState = (s, cls) => { $('state').textContent = s; $('state').className = 'badge ' + (cls ?? 'loading'); };
+const blockMs = [];
+const p50 = () => { if (!blockMs.length) return '–'; const s=[...blockMs].sort((a,b)=>a-b); return s[Math.floor(s.length/2)].toFixed(0)+'ms'; };
+
+window.__ssrm = { failures: 0, requests: 0, groupRequests: 0, leafRequests: 0, errors: [], rowCount: null,
+                  viewsOpened: 0, evictions: 0, states: [], ready: false };
+
+const REF = { datasourceId: 'positions', params: { clientId: 'trd1', rate: 2000, batchSize: 10 } };
+const artifact = await (await fetch('/packages/dshub-spec/corpus/positions/artifact.json')).json();
+
+const v = new URLSearchParams(location.search).get('v') ?? 'ssrm1';
+const worker = new SharedWorker(`/apps/dshub-spike/web/dshub.worker.mjs?v=${v}`, { type: 'module', name: `dshub-${v}` });
+
+const control = new ControlClient({ send: (m) => transport.send(m), timeoutMs: 60_000 });
+const transport = new Transport({
+  connect: () => worker.port,
+  onControl: (m) => { if (m.type === 'result' && m.payload?.ready) { boot(); return; } control.handle(m); },
+  onState: (s) => { if (s === 'disconnected') control.failAll(); },
+});
+transport.open();
+
+let resolveLive; const liveOnce = new Promise((r) => { resolveLive = r; });
+control.on('state', (m) => { window.__ssrm.states.push(m.state); if (m.state === 'live') resolveLive?.(); });
+
+const dataService = new HubDataService({
+  control, ref: REF, artifact, mode: 'ssrm',
+  keyColumns: ['positionId'], softDeleteColumn: '_deleted',
+  searchColumns: ['desk', 'trader', 'bookName'],
+});
+
+// Count what the mode actually does, so the demo shows the view cache working.
+const origOpen = dataService.openView.bind(dataService);
+dataService.openView = async (spec) => { window.__ssrm.viewsOpened++; return origOpen(spec); };
+
+window.__svc = dataService;
+window.__mode = () => ssrm;
+const ssrm = new SsrmMode({
+  dataService, artifact, keyColumns: ['positionId'], softDeleteColumn: '_deleted', maxViews: 12,
+});
+
+// Group-capable columns first, so the tree is easy to exercise.
+const all = buildColDefs(artifact, dataService);
+const pick = (n) => all.find((d) => d.colId === n || d.field === n);
+const colDefs = [
+  { ...pick('desk'), rowGroup: true, hide: true },
+  { ...pick('trader'), enableRowGroup: true },
+  { ...pick('bookName'), enableRowGroup: true },
+  { ...pick('instrumentType') },
+  { ...pick('marketValue'), aggFunc: 'sum' },
+  { ...pick('notionalAmount'), aggFunc: 'sum' },
+  { ...pick('dv01'), aggFunc: 'sum' },
+  { ...pick('currentPrice') },
+  { ...pick('positionId') },
+].filter((d) => d.colId);
+
+const theme = themeQuartz.withPart(colorSchemeDark).withPart(iconSetQuartzBold).withParams({
+  backgroundColor: '#14181d', foregroundColor: '#e7eaed', borderColor: '#2b3138',
+  headerBackgroundColor: '#1a1e23', headerTextColor: '#8a939c', oddRowBackgroundColor: '#171b21',
+  rowHoverColor: '#1e242b', accentColor: '#e5a244',
+  fontFamily: 'ui-monospace, Menlo, monospace', fontSize: 12, headerFontSize: 11,
+  rowHeight: 26, headerHeight: 30, cellHorizontalPadding: 8,
+});
+
+/**
+ * Cell-selection persistence (Phase 8g). SSRM discards blocks as you scroll, so
+ * AG-Grid's index-based cell range evaporates on a drag past the viewport. The
+ * tracker re-anchors it to row keys and restores after each block load.
+ */
+let cellSel = null;
+const gridApi = createGrid($('grid'), {
+  cellSelection: true,
+  theme,
+  columnDefs: colDefs,
+  rowModelType: 'serverSide',
+  getRowId: (p) => ssrm.getRowId(p),
+  defaultColDef: { sortable: true, resizable: true, filter: true, flex: 1, minWidth: 120 },
+  autoGroupColumnDef: { headerName: 'Group', minWidth: 260, cellRendererParams: { suppressCount: false } },
+  // Bounds browser memory. Unset, SSRM is CSRM with extra steps (parity §2.2).
+  maxBlocksInCache: 10,
+  cacheBlockSize: 200,
+  // Without this a fast scroll fires a request per frame.
+  blockLoadDebounceMillis: 80,
+  rowGroupPanelShow: 'always',
+  onCellSelectionChanged: () => cellSel?.onCellSelectionChanged(),
+  // Blocks land on model update / store refresh; restore the range then.
+  onModelUpdated: () => cellSel?.onBlocksLoaded(),
+  pivotPanelShow: 'always',
+  // Perspective names split columns `AUD|marketValue`. AG-Grid's default
+  // separator is '_', and with the wrong one it cannot decompose the field into
+  // pivot key and value column — the pivot renders empty despite correct data.
+  serverSidePivotResultFieldSeparator: '|',
+});
+
+cellSel = attachCellSelection(gridApi, (data) => ssrm.getRowId({ data, level: -1 }));
+// Bind drag tracking so live-feed refreshes never fight an in-progress selection.
+cellSel.bindDrag($('grid'));
+window.__cellSel = cellSel;
+
+window.__gridApi = gridApi;
+
+async function boot() {
+  if (window.__ssrm.ready) return;
+  window.__ssrm.ready = true;
+  try {
+    await control.hello({ appId: 'ssrm-blotter' });
+    // `notify`: SSRM re-fetches its own blocks, so the delta rows would be
+    // decoded and discarded. The count is all it needs.
+    await control.subscribe(REF, { delivery: 'notify' });
+    setState('snapshotting');
+    await Promise.race([
+      liveOnce,
+      new Promise((_, rej) => setTimeout(() => rej(new Error('no live state within 60s')), 60_000)),
+    ]);
+    setState('live', 'live');
+
+    window.__ssrm.rowCount = (await control.rowCount(REF, {})).payload;
+    $('rows').textContent = Number(window.__ssrm.rowCount).toLocaleString();
+
+    // Only now attach the datasource: SSRM starts fetching immediately, and
+    // fetching before `live` reads an empty table.
+    gridApi.setGridOption('serverSideDatasource', instrumented(ssrm.datasource()));
+
+    // Live. SSRM has no delta path — refetching the loaded blocks is the only
+    // way to show new values, so this is coalesced to once a second.
+    ssrm.attach(control, gridApi, { refreshMs: 1000, ref: REF });
+
+    // Group-aggregate deltas (§8e): tell the hub which grouping to watch, and
+    // re-tell it whenever the grid's row grouping changes.
+    const requestGroupWatch = () => {
+      const groupBy = gridApi.getRowGroupColumns().map((c) => c.getColId());
+      if (!groupBy.length) return;
+      const aggregates = {};
+      for (const c of ['marketValue', 'notionalAmount', 'dv01']) aggregates[c] = 'sum';
+      ssrm.watchGroups(groupBy, aggregates);
+    };
+    requestGroupWatch();
+    gridApi.addEventListener('columnRowGroupChanged', requestGroupWatch);
+
+    // Quick filter. It cannot go through setFilterModel — `__search__` is not a
+    // grid column, and AG-Grid silently ignores filter entries for columns that
+    // do not exist.
+    $('search').addEventListener('input', (e) => {
+      ssrm.setSearch(dataService.search(e.target.value, ['desk', 'trader', 'bookName']), gridApi);
+    });
+  } catch (e) {
+    $('err').textContent = String(e.message ?? e).slice(0, 140);
+    window.__ssrm.errors.push(String(e.message ?? e));
+    setState('failed', 'failed');
+  }
+}
+
+/** Wrap getRows so the demo can show request counts and block latency. */
+function instrumented(ds) {
+  return {
+    ...ds,
+    getRows: (params) => {
+      const t0 = performance.now();
+      const isGroup = (params.request.rowGroupCols?.length ?? 0) > (params.request.groupKeys?.length ?? 0);
+      window.__ssrm.requests++;
+      if (isGroup) window.__ssrm.groupRequests++; else window.__ssrm.leafRequests++;
+      const done = () => {
+        blockMs.push(performance.now() - t0);
+        if (blockMs.length > 200) blockMs.shift();
+      };
+      const wrapped = {
+        ...params,
+        success: (r) => { done(); params.success(r); },
+        fail: () => { done(); params.fail(); },
+      };
+      return ds.getRows(wrapped);
+    },
+  };
+}
+
+setInterval(() => {
+  $('reqs').textContent = window.__ssrm.requests;
+  $('views').textContent = ssrm.cache.size;
+  $('evicted').textContent = ssrm.cache.evictions;
+  window.__ssrm.evictions = ssrm.cache.evictions;
+  $('p50').textContent = p50();
+  $('refreshes').textContent = ssrm.refreshes;
+  window.__ssrm.refreshes = ssrm.refreshes;
+  window.__ssrm.lastError = ssrm.lastError ?? null;
+  window.__ssrm.failures = ssrm.failures;
+  window.__ssrm.ignoredSoftDelete = ssrm.ignoredSoftDelete;
+}, 500);
+</script>

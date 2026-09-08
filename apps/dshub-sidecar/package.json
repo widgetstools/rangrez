@@ -1,0 +1,16 @@
+{
+  "name": "@wellsfargo-starui/dshub-sidecar",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "The DataSource Hub, run outside the browser: the real Hub over socket.io, on Perspective's Node engine.",
+  "bin": { "dshub-sidecar": "./server.mjs" },
+  "scripts": {
+    "start": "node server.mjs",
+    "smoke": "node smoke.mjs"
+  },
+  "dependencies": {
+    "@perspective-dev/client": "*",
+    "ws": "*"
+  }
+}

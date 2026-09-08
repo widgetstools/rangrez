@@ -1,0 +1,6 @@
+# Pinned per project decision. Note: 1.78 predates edition 2024 (needs 1.85+),
+# so hub-rust is edition 2021. Verify MSRV of tokio / tungstenite / perspective
+# bindings against this before Phase 10 — several may require newer.
+[toolchain]
+channel = "1.78.0"
+components = ["rustfmt", "clippy"]

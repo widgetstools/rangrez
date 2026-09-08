@@ -1,0 +1,77 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>dshub SharedWorker harness</title>
+<style>
+  body { font: 13px ui-monospace, Menlo, monospace; margin: 20px; background:#14181d; color:#e7eaed; }
+  pre { white-space: pre-wrap; line-height: 1.5; }
+  .ok { color:#7fd18a } .err { color:#e8776a } .k { color:#e5a244 }
+</style>
+<h3>dshub SharedWorker harness</h3>
+<pre id="out">connecting…</pre>
+<script type="module">
+  const out = document.getElementById('out');
+  const log = [];
+  const put = (s, cls) => { log.push(cls ? `<span class="${cls}">${s}</span>` : s); out.innerHTML = log.join('\n'); };
+
+  // Results the driver reads back out of the page.
+  window.__dshub = { ready: null, subscribed: null, subscriptions: [], states: [], errors: [], rows: null, payloads: [] };
+
+  // A SharedWorker is keyed by (url, name) and outlives any single tab, so a
+  // stale instance survives a reload while other tabs still hold it. The
+  // version token lets the harness force every tab onto a fresh worker.
+  const v = new URLSearchParams(location.search).get('v') ?? '1';
+  const worker = new SharedWorker(`/apps/dshub-spike/web/dshub.worker.mjs?v=${v}`, { type: 'module', name: `dshub-${v}` });
+  const port = worker.port;
+  port.start();
+
+  const send = (m) => port.postMessage(m);
+
+  port.onmessage = (ev) => {
+    const m = ev.data;
+    window.__dshub.payloads.push(m);
+
+    if (m.type === 'error') {
+      window.__dshub.errors.push(m.message);
+      put(`ERROR [${m.code}] ${m.message}`, 'err');
+      return;
+    }
+    if (m.type === 'result' && m.payload?.ready) {
+      window.__dshub.ready = m.payload;
+      put(`ready — session ${m.payload.sessionId}, sessions=${m.payload.sessions}, memory64=${m.payload.memory64}`, 'ok');
+      send({ id: 'h1', type: 'hello', protocolVersion: 1, appId: location.hash || 'tab' });
+      return;
+    }
+    if (m.type === 'configAck') {
+      put(`configAck — ${m.status} @v${m.bundleVersion}`);
+      // One blotter, N DISTINCT subscriptions. A different clientId is a
+      // different cache key, so each gets its own table and its own upstream
+      // connection — the "max 10 tables per trader" working set.
+      const n = +(new URLSearchParams(location.search).get('subs') ?? '1');
+      for (let i = 1; i <= n; i++) {
+        send({ id: `s${i}`, type: 'subscribe',
+               ref: { datasourceId: 'positions', params: { clientId: `trd${i}`, rate: 500, batchSize: 10 } } });
+      }
+      put(`requested ${n} subscription(s)`);
+      return;
+    }
+    if (m.type === 'subscribed') {
+      window.__dshub.subscribed = m;
+      (window.__dshub.subscriptions ??= []).push(m.tableName);
+      put(`subscribed [${window.__dshub.subscriptions.length}] ${m.tableName.slice(0, 56)}`, 'ok');
+      return;
+    }
+    if (m.type === 'state') {
+      window.__dshub.states.push(m.state);
+      put(`state — <span class="k">${m.state}</span>${m.detail ? ' — ' + m.detail : ''}`);
+      return;
+    }
+    put(JSON.stringify(m).slice(0, 200));
+  };
+
+  // Poll stats so the driver can read row counts without extra plumbing.
+  window.__dshubStats = () => new Promise((res) => {
+    const h = (ev) => { if (ev.data?.type === 'result' && ev.data.payload?.tables !== undefined) { port.removeEventListener('message', h); res(ev.data.payload); } };
+    port.addEventListener('message', h);
+    send({ id: 'st', type: 'stats' });
+  });
+</script>

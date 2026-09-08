@@ -1,0 +1,17 @@
+{
+  "name": "@wellsfargo-starui/dshub-spike",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "echo no-typescript-yet",
+    "dev": "node src/run.mjs",
+    "lint": "echo no-lint-yet",
+    "test": "echo spike-is-not-a-test-suite",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "@perspective-dev/server": "5.3.0",
+    "@perspective-dev/client": "5.3.0"
+  }
+}

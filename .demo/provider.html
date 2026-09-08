@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>HubDataProvider demo</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; font: 13px ui-monospace, Menlo, monospace; background: #0e1216; color: #e7eaed; }
+  header { padding: 10px 16px; background: #14181d; border-bottom: 1px solid #2b3138; display: flex; gap: 16px; align-items: center; flex-wrap: wrap; }
+  header h1 { font-size: 14px; margin: 0; font-weight: 600; }
+  .sub { color: #8a939c; font-size: 11px; }
+  .pill { padding: 2px 9px; border-radius: 10px; font-size: 11px; background: #1e2733; color: #7fb2e5; }
+  .pill.csrm { background: #26311c; color: #9ccc6b; }
+  a { color: #e5a244; text-decoration: none; } a:hover { text-decoration: underline; }
+  #grid { height: calc(100vh - 52px); width: 100%; }
+</style>
+</head>
+<body>
+<header>
+  <h1>HubDataProvider</h1>
+  <span id="mode" class="pill">…</span>
+  <span class="sub">grid ⟶ provider ⟶ hub :8787 ⟶ STOMP :8081</span>
+  <span class="sub">switch: <a href="?mode=ssrm">SSRM</a> · <a href="?mode=csrm">CSRM</a></span>
+  <span class="sub" id="status">connecting…</span>
+</header>
+<div id="grid"></div>
+
+<script type="importmap">
+{
+  "imports": {
+    "ag-stack": "/node_modules/ag-stack/dist/package/main.esm.mjs",
+    "ag-grid-community": "/node_modules/ag-grid-community/dist/package/main.esm.mjs",
+    "ag-grid-enterprise": "/node_modules/ag-grid-enterprise/dist/package/main.esm.mjs"
+  }
+}
+</script>
+
+<script type="module">
+import { ModuleRegistry, createGrid, themeQuartz, colorSchemeDark, iconSetQuartzBold } from 'ag-grid-community';
+import { AllEnterpriseModule } from 'ag-grid-enterprise';
+import { HubDataProvider } from './hub-data-provider.mjs';
+ModuleRegistry.registerModules([AllEnterpriseModule]);
+
+const mode = (new URLSearchParams(location.search).get('mode') || 'ssrm').toLowerCase();
+document.getElementById('mode').textContent = mode.toUpperCase();
+document.getElementById('mode').className = 'pill ' + mode;
+
+// ── the ENTIRE app: describe the datasource, make a provider, wire the grid ──
+const dp = new HubDataProvider({
+  hubUrl: 'ws://127.0.0.1:8787',
+  mode,
+  params: { clientId: 'provider-' + mode, rate: 2000, batchSize: 10 },
+  grid: { group: ['desk', 'trader'], agg: { marketValue: 'sum', notionalAmount: 'sum', dv01: 'sum' } },
+  datasource: {
+    id: 'positions', schemaRef: 'positions@v1', keyColumns: ['positionId'],
+    columns: [
+      { name: 'positionId', type: 'string' }, { name: 'desk', type: 'string' }, { name: 'trader', type: 'string' },
+      { name: 'bookName', type: 'string' }, { name: 'instrumentType', type: 'string' }, { name: 'currency', type: 'string' },
+      { name: 'marketValue', type: 'integer' }, { name: 'notionalAmount', type: 'integer' }, { name: 'dv01', type: 'float' },
+      { name: 'currentPrice', type: 'float' }, { name: 'quantity', type: 'integer' }, { name: 'pnl', type: 'integer' },
+    ],
+    connection: { transport: 'stomp', url: 'ws://127.0.0.1:8081', vhost: 'localhost', heartbeat: { outMs: 1000, inMs: 10000 } },
+    snapshot: { mode: 'trigger-reply', triggerDestination: '/snapshot/positions/{clientId}/{rate}/{batchSize}', replyDestination: '/snapshot/positions/{clientId}' },
+    updates: { destination: '/snapshot/positions/{clientId}', bodyShape: 'record-array' },
+  },
+});
+
+const theme = themeQuartz.withPart(colorSchemeDark).withPart(iconSetQuartzBold).withParams({
+  backgroundColor: '#0e1216', foregroundColor: '#e7eaed', borderColor: '#2b3138',
+  headerBackgroundColor: '#14181d', headerTextColor: '#8a939c', oddRowBackgroundColor: '#12161b',
+  rowHoverColor: '#1a1f26', accentColor: '#e5a244', fontFamily: 'ui-monospace, Menlo, monospace',
+  fontSize: 12, headerFontSize: 11, rowHeight: 26, headerHeight: 30,
+});
+
+try {
+  await dp.connect();
+  const api = createGrid(document.getElementById('grid'), {
+    theme,
+    columnDefs: dp.columnDefs(),
+    defaultColDef: { sortable: true, resizable: true, filter: true, flex: 1, minWidth: 110 },
+    ...dp.gridOptions(),
+  });
+  dp.attach(api);
+  window.__dp = dp; window.__grid = api;
+  document.getElementById('status').textContent = mode === 'csrm' ? 'live — all rows in the grid, applyTransactionAsync' : 'live — server-side blocks + pushed deltas';
+} catch (e) {
+  document.getElementById('status').textContent = 'error: ' + (e.message ?? e);
+  console.error(e);
+}
+</script>
+</body>
+</html>

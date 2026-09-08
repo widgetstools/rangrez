@@ -1,0 +1,278 @@
+{
+  "specVersion": "1.0",
+  "connections": [
+    {
+      "id": "stomp-view-server",
+      "kind": "stomp",
+      "url": "ws://localhost:8081",
+      "heartbeat": {
+        "outMs": 0,
+        "inMs": 0
+      },
+      "auth": {
+        "mode": "none"
+      },
+      "reconnect": {
+        "initialMs": 500,
+        "maxMs": 30000,
+        "factor": 2,
+        "maxAttempts": null
+      }
+    },
+    {
+      "id": "replay-rest",
+      "kind": "rest",
+      "url": "http://localhost:8123",
+      "auth": {
+        "mode": "none"
+      },
+      "reconnect": {
+        "initialMs": 500,
+        "maxMs": 30000,
+        "factor": 2,
+        "maxAttempts": null
+      },
+      "updatesUrl": "ws://localhost:8123/ws",
+      "updatesKind": "ws"
+    },
+    {
+      "id": "replay-ws",
+      "kind": "ws",
+      "url": "ws://localhost:8123/ws",
+      "auth": {
+        "mode": "none"
+      },
+      "reconnect": {
+        "initialMs": 500,
+        "maxMs": 30000,
+        "factor": 2,
+        "maxAttempts": null
+      }
+    }
+  ],
+  "datasources": [
+    {
+      "id": "positions",
+      "connectionRef": "stomp-view-server",
+      "schemaRef": "positions@v1",
+      "snapshot": {
+        "mode": "trigger-reply",
+        "triggerDestination": "/snapshot/positions/{clientId}/{rate}/{batchSize}",
+        "replyDestination": "/snapshot/positions/{clientId}",
+        "endOfSnapshot": {
+          "kind": "sentinel-header",
+          "header": "message-type",
+          "value": "snapshot-complete"
+        },
+        "timeoutMs": 120000
+      },
+      "updates": {
+        "destination": "/snapshot/positions/{clientId}",
+        "bodyShape": "record-array",
+        "subscribeBeforeSnapshot": true,
+        "updatesDuringSnapshot": "buffer"
+      },
+      "keyColumns": [
+        "positionId"
+      ],
+      "flatten": {
+        "separator": "_",
+        "maxDepth": 6,
+        "arrays": {
+          "swapLegs": {
+            "strategy": "explode",
+            "childTable": "positions-swap-legs"
+          }
+        }
+      },
+      "batch": {
+        "maxMs": 50,
+        "maxRows": 5000,
+        "dedupeByKey": true
+      },
+      "conflation": {
+        "defaultIntervalMs": 100,
+        "maxIntervalMs": 1000
+      },
+      "params": {
+        "clientId": {
+          "type": "string",
+          "required": true,
+          "default": "trd1"
+        },
+        "rate": {
+          "type": "number",
+          "required": true,
+          "default": 2000
+        },
+        "batchSize": {
+          "type": "number",
+          "required": false,
+          "default": 10
+        },
+        "desk": {
+          "type": "string",
+          "required": false
+        }
+      },
+      "lifecycle": {
+        "prewarm": false,
+        "idleTeardownMs": 300000,
+        "maxRows": 50000
+      },
+      "sharing": {
+        "strategy": "superset",
+        "supersetParams": {
+          "desk": "*"
+        }
+      }
+    },
+    {
+      "id": "positions-ws",
+      "connectionRef": "replay-ws",
+      "schemaRef": "positions@v1",
+      "snapshot": {
+        "mode": "trigger-reply",
+        "triggerDestination": "snap",
+        "replyDestination": "positions",
+        "triggerBody": {
+          "req": "snap"
+        },
+        "endOfSnapshot": {
+          "kind": "sentinel-body",
+          "path": "type",
+          "value": "end"
+        },
+        "expectedCountHeader": "total",
+        "timeoutMs": 120000
+      },
+      "updates": {
+        "destination": "positions",
+        "bodyShape": "record-array",
+        "subscribeBeforeSnapshot": true,
+        "updatesDuringSnapshot": "buffer"
+      },
+      "keyColumns": [
+        "positionId"
+      ],
+      "flatten": {
+        "separator": "_",
+        "maxDepth": 6,
+        "arrays": {
+          "swapLegs": {
+            "strategy": "explode",
+            "childTable": "positions-swap-legs"
+          }
+        }
+      },
+      "batch": {
+        "maxMs": 50,
+        "maxRows": 5000,
+        "dedupeByKey": true
+      },
+      "conflation": {
+        "defaultIntervalMs": 100,
+        "maxIntervalMs": 1000
+      },
+      "params": {
+        "clientId": {
+          "type": "string",
+          "required": true,
+          "default": "trd1"
+        },
+        "rate": {
+          "type": "number",
+          "required": true,
+          "default": 2000
+        },
+        "batchSize": {
+          "type": "number",
+          "required": false,
+          "default": 10
+        },
+        "desk": {
+          "type": "string",
+          "required": false
+        }
+      },
+      "lifecycle": {
+        "prewarm": false,
+        "idleTeardownMs": 300000,
+        "maxRows": 50000
+      }
+    },
+    {
+      "id": "positions-rest",
+      "connectionRef": "replay-rest",
+      "schemaRef": "positions@v1",
+      "snapshot": {
+        "mode": "rest-then-subscribe",
+        "url": "http://localhost:8123/rest/positions",
+        "method": "GET",
+        "pagination": {
+          "style": "offset",
+          "pageSize": 5000
+        },
+        "endOfSnapshot": {
+          "kind": "stream-end"
+        },
+        "expectedCountHeader": "X-Total-Count",
+        "timeoutMs": 120000
+      },
+      "updates": {
+        "destination": "positions",
+        "bodyShape": "record-array",
+        "subscribeBeforeSnapshot": true,
+        "updatesDuringSnapshot": "buffer"
+      },
+      "keyColumns": [
+        "positionId"
+      ],
+      "flatten": {
+        "separator": "_",
+        "maxDepth": 6,
+        "arrays": {
+          "swapLegs": {
+            "strategy": "explode",
+            "childTable": "positions-swap-legs"
+          }
+        }
+      },
+      "batch": {
+        "maxMs": 50,
+        "maxRows": 5000,
+        "dedupeByKey": true
+      },
+      "conflation": {
+        "defaultIntervalMs": 100,
+        "maxIntervalMs": 1000
+      },
+      "params": {
+        "clientId": {
+          "type": "string",
+          "required": true,
+          "default": "trd1"
+        },
+        "rate": {
+          "type": "number",
+          "required": true,
+          "default": 2000
+        },
+        "batchSize": {
+          "type": "number",
+          "required": false,
+          "default": 10
+        },
+        "desk": {
+          "type": "string",
+          "required": false
+        }
+      },
+      "lifecycle": {
+        "prewarm": false,
+        "idleTeardownMs": 300000,
+        "maxRows": 50000
+      }
+    }
+  ]
+}

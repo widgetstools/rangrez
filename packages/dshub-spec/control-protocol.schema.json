@@ -1,0 +1,1194 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wellsfargo-starui/dshub/control-protocol.schema.json",
+  "title": "Control protocol",
+  "description": "Every message on the control channel (architecture \u00a77.2). The control channel carries these as plain objects over a MessagePort in worker mode, or as WebSocket text frames with the sidecar. Binary frames and ArrayBuffer transfers are Perspective's own protocol and never appear here.",
+  "specVersion": "1.0",
+  "protocolVersion": 1,
+  "oneOf": [
+    {
+      "$ref": "#/$defs/clientMessage"
+    },
+    {
+      "$ref": "#/$defs/hubMessage"
+    }
+  ],
+  "$defs": {
+    "envelope": {
+      "type": "object",
+      "required": [
+        "id",
+        "type"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Correlation id. Responses and errors echo it; server-pushed events use a fresh one."
+        },
+        "type": {
+          "type": "string"
+        }
+      }
+    },
+    "subscriptionRef": {
+      "type": "object",
+      "required": [
+        "datasourceId"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "datasourceId": {
+          "type": "string"
+        },
+        "params": {
+          "type": "object",
+          "description": "Substituted into topic templates and snapshot bodies. (datasourceId, canonicalParamsHash) is the table cache key (architecture \u00a76)."
+        }
+      }
+    },
+    "viewSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Our shape, not Perspective's. The engine adapter translates (architecture \u00a78.1).",
+      "properties": {
+        "filter": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "groupBy": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "splitBy": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "sort": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "column",
+              "dir"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "column": {
+                "type": "string"
+              },
+              "dir": {
+                "enum": [
+                  "asc",
+                  "desc"
+                ]
+              }
+            }
+          }
+        },
+        "aggregates": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "columns": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "expressions": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "depth": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Levels of the group tree to expand. Maps to Perspective's set_depth() METHOD, not a view-config field \u2014 SSRM uses depth 1 to get exactly one level of children per expansion."
+        }
+      }
+    },
+    "state": {
+      "enum": [
+        "idle",
+        "connecting",
+        "snapshotting",
+        "live",
+        "stale",
+        "recovering",
+        "failed"
+      ],
+      "description": "architecture \u00a75.4. 'stale' is what lets a blotter grey out \u2014 silence must never be ambiguous between a quiet market and a dead upstream."
+    },
+    "errorCode": {
+      "enum": [
+        "unknown-datasource",
+        "invalid-params",
+        "config-invalid",
+        "config-conflict",
+        "snapshot-timeout",
+        "snapshot-truncated",
+        "upstream-unavailable",
+        "row-limit-exceeded",
+        "memory-ceiling-exceeded",
+        "transport-unavailable",
+        "protocol-version-mismatch",
+        "unsupported-expression",
+        "command-failed",
+        "backpressure-disconnect",
+        "internal"
+      ],
+      "description": "Typed so the UI can act rather than render a string."
+    },
+    "clientMessage": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/envelope"
+        }
+      ],
+      "oneOf": [
+        {
+          "title": "hello",
+          "required": [
+            "id",
+            "type",
+            "protocolVersion",
+            "appId"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "hello"
+            },
+            "protocolVersion": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "appId": {
+              "type": "string"
+            },
+            "token": {
+              "type": "string",
+              "description": "Sidecar only; a MessagePort is same-origin by construction (architecture \u00a72.2)."
+            },
+            "bundleVersion": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "bundleChecksum": {
+              "type": "string",
+              "description": "REQUIRED for reconcile correctness. Comparing bundleVersion alone lets two apps that both bumped 12->13 offline meet at 'equal -> nothing' and stay divergent forever (architecture \u00a73.6)."
+            }
+          }
+        },
+        {
+          "title": "pushConfig",
+          "required": [
+            "id",
+            "type",
+            "bundle"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "pushConfig"
+            },
+            "bundle": {
+              "type": "object"
+            }
+          }
+        },
+        {
+          "title": "subscribe",
+          "required": [
+            "id",
+            "type",
+            "ref"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "subscribe"
+            },
+            "ref": {
+              "$ref": "#/$defs/subscriptionRef"
+            },
+            "delivery": {
+              "enum": [
+                "rows",
+                "notify"
+              ],
+              "default": "rows",
+              "description": "What rowDelta carries. `rows` ships the changed rows (CSRM keeps a local copy, so it needs them). `notify` ships only a count: VRM and SSRM re-read their own window and would discard the payload, so shipping it would put CSRM-sized traffic on the wire and cost VRM its entire reason for existing."
+            }
+          }
+        },
+        {
+          "title": "unsubscribe",
+          "required": [
+            "id",
+            "type",
+            "ref"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "unsubscribe"
+            },
+            "ref": {
+              "$ref": "#/$defs/subscriptionRef"
+            }
+          }
+        },
+        {
+          "title": "distinctValues",
+          "required": [
+            "id",
+            "type",
+            "ref",
+            "colId"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "distinctValues"
+            },
+            "ref": {
+              "$ref": "#/$defs/subscriptionRef"
+            },
+            "colId": {
+              "type": "string"
+            },
+            "contextFilter": {
+              "type": "array",
+              "items": {
+                "type": "object"
+              }
+            },
+            "limit": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "withCounts": {
+              "type": "boolean"
+            }
+          }
+        },
+        {
+          "title": "searchValues",
+          "required": [
+            "id",
+            "type",
+            "ref",
+            "colId",
+            "prefix"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "searchValues"
+            },
+            "ref": {
+              "$ref": "#/$defs/subscriptionRef"
+            },
+            "colId": {
+              "type": "string"
+            },
+            "prefix": {
+              "type": "string"
+            },
+            "limit": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        },
+        {
+          "title": "rowCount",
+          "required": [
+            "id",
+            "type",
+            "ref"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "rowCount"
+            },
+            "ref": {
+              "$ref": "#/$defs/subscriptionRef"
+            },
+            "view": {
+              "$ref": "#/$defs/viewSpec"
+            }
+          }
+        },
+        {
+          "title": "aggregates",
+          "required": [
+            "id",
+            "type",
+            "ref",
+            "specs"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "aggregates"
+            },
+            "ref": {
+              "$ref": "#/$defs/subscriptionRef"
+            },
+            "specs": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "column",
+                  "fn"
+                ],
+                "additionalProperties": false,
+                "properties": {
+                  "column": {
+                    "type": "string"
+                  },
+                  "fn": {
+                    "type": "string"
+                  },
+                  "as": {
+                    "type": "string"
+                  }
+                }
+              }
+            },
+            "view": {
+              "$ref": "#/$defs/viewSpec"
+            }
+          }
+        },
+        {
+          "title": "openView",
+          "description": "Open a server-side view and keep it. SSRM holds one per expanded node, so views are session-scoped and released when the session goes.",
+          "required": [
+            "id",
+            "type",
+            "ref",
+            "view"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "openView"
+            },
+            "ref": {
+              "$ref": "#/$defs/subscriptionRef"
+            },
+            "view": {
+              "$ref": "#/$defs/viewSpec"
+            }
+          }
+        },
+        {
+          "title": "readWindow",
+          "required": [
+            "id",
+            "type",
+            "viewId"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "readWindow"
+            },
+            "viewId": {
+              "type": "string"
+            },
+            "startRow": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "endRow": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        {
+          "title": "expandRow",
+          "description": "Expand or collapse a node in a managed tree view, by ROW INDEX. VRM works on one view for the whole tree, unlike SSRM which opens one per expanded node.",
+          "required": [
+            "id",
+            "type",
+            "viewId",
+            "index"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "expandRow"
+            },
+            "viewId": {
+              "type": "string"
+            },
+            "index": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "collapse": {
+              "type": "boolean"
+            }
+          }
+        },
+        {
+          "title": "disposeView",
+          "required": [
+            "id",
+            "type",
+            "viewId"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "disposeView"
+            },
+            "viewId": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "title": "rank",
+          "required": [
+            "id",
+            "type",
+            "ref",
+            "key"
+          ],
+          "additionalProperties": false,
+          "description": "Index of a row under the current sort and filter \u2014 what ensureIndexVisible needs in SSRM (parity study \u00a73).",
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "rank"
+            },
+            "ref": {
+              "$ref": "#/$defs/subscriptionRef"
+            },
+            "key": {
+              "type": "string"
+            },
+            "view": {
+              "$ref": "#/$defs/viewSpec"
+            }
+          }
+        },
+        {
+          "title": "export",
+          "required": [
+            "id",
+            "type",
+            "ref",
+            "fmt"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "export"
+            },
+            "ref": {
+              "$ref": "#/$defs/subscriptionRef"
+            },
+            "fmt": {
+              "enum": [
+                "csv",
+                "xlsx"
+              ]
+            },
+            "view": {
+              "$ref": "#/$defs/viewSpec"
+            }
+          }
+        },
+        {
+          "title": "scan",
+          "required": [
+            "id",
+            "type",
+            "ref"
+          ],
+          "additionalProperties": false,
+          "description": "Streamed batches for whole-dataset iteration \u2014 the SSRM replacement for forEachNode.",
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "scan"
+            },
+            "ref": {
+              "$ref": "#/$defs/subscriptionRef"
+            },
+            "view": {
+              "$ref": "#/$defs/viewSpec"
+            },
+            "batchRows": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        },
+        {
+          "title": "command",
+          "required": [
+            "id",
+            "type",
+            "ref",
+            "verb",
+            "idempotencyKey"
+          ],
+          "additionalProperties": false,
+          "description": "Write path. Perspective is a read model (architecture \u00a78.6). v1 scope is annotations.",
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "command"
+            },
+            "ref": {
+              "$ref": "#/$defs/subscriptionRef"
+            },
+            "verb": {
+              "type": "string"
+            },
+            "idempotencyKey": {
+              "type": "string",
+              "description": "REQUIRED. A network retry must never double-apply. Also the key for resolving ambiguous timeout state."
+            },
+            "payload": {
+              "type": "object"
+            },
+            "timeoutMs": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        },
+        {
+          "title": "alertSubscribe",
+          "required": [
+            "id",
+            "type",
+            "ref",
+            "ruleId"
+          ],
+          "additionalProperties": false,
+          "description": "Registers a DSL rule as a hub-side alert. Must be hub-side: in SSRM the client only ever sees a window (architecture \u00a79.1).",
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "alertSubscribe"
+            },
+            "ref": {
+              "$ref": "#/$defs/subscriptionRef"
+            },
+            "ruleId": {
+              "type": "string"
+            },
+            "predicate": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "title": "stats",
+          "required": [
+            "id",
+            "type"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "stats"
+            },
+            "subscribe": {
+              "type": "boolean"
+            }
+          }
+        },
+        {
+          "title": "ack",
+          "required": [
+            "id",
+            "type",
+            "seq"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "ack"
+            },
+            "ref": {
+              "$ref": "#/$defs/subscriptionRef"
+            },
+            "seq": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Highest delta sequence this subscriber has APPLIED. A MessagePort exposes no send-queue depth, so this is the only signal that distinguishes a tab keeping up from one whose main thread is wedged (architecture \u00a77.4)."
+            }
+          }
+        },
+        {
+          "title": "watchGroups",
+          "required": [
+            "id",
+            "type",
+            "ref",
+            "groupBy"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "watchGroups"
+            },
+            "ref": {
+              "$ref": "#/$defs/subscriptionRef"
+            },
+            "groupBy": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "aggregates": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            }
+          },
+          "description": "Ask the hub to watch a grouped view and push groupDelta events (Phase 8e). Per session and per grouping."
+        },
+        {
+          "title": "alertUnsubscribe",
+          "required": [
+            "id",
+            "type",
+            "ruleId"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "alertUnsubscribe"
+            },
+            "ruleId": {
+              "type": "string"
+            }
+          }
+        }
+      ]
+    },
+    "hubMessage": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/envelope"
+        }
+      ],
+      "oneOf": [
+        {
+          "title": "configAck",
+          "required": [
+            "id",
+            "type",
+            "status",
+            "bundleVersion"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "configAck"
+            },
+            "status": {
+              "enum": [
+                "current",
+                "hub-newer",
+                "app-newer",
+                "conflict"
+              ],
+              "description": "'conflict' means equal bundleVersion with differing checksum. Neither side wins automatically \u2014 the app opens the import diff view and the user picks (architecture \u00a73.6)."
+            },
+            "bundleVersion": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "bundleChecksum": {
+              "type": "string"
+            },
+            "bundle": {
+              "type": "object",
+              "description": "Present when status is hub-newer or conflict."
+            }
+          }
+        },
+        {
+          "title": "subscribed",
+          "required": [
+            "id",
+            "type",
+            "tableName",
+            "schemaRef",
+            "mode"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "subscribed"
+            },
+            "tableName": {
+              "type": "string"
+            },
+            "schemaRef": {
+              "type": "string"
+            },
+            "mode": {
+              "enum": [
+                "csrm",
+                "ssrm",
+                "vrm"
+              ],
+              "description": "Chosen by the hub from estimatedRows, never by the user (architecture \u00a78.3)."
+            },
+            "estimatedRows": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        {
+          "title": "state",
+          "required": [
+            "id",
+            "type",
+            "ref",
+            "state"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "state"
+            },
+            "ref": {
+              "$ref": "#/$defs/subscriptionRef"
+            },
+            "state": {
+              "$ref": "#/$defs/state"
+            },
+            "since": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "detail": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "title": "schemaChanged",
+          "required": [
+            "id",
+            "type",
+            "ref",
+            "schemaRef"
+          ],
+          "additionalProperties": false,
+          "description": "Perspective cannot add a column to a live table; evolution is a rebuild and the client must re-init (architecture \u00a74.4).",
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "schemaChanged"
+            },
+            "ref": {
+              "$ref": "#/$defs/subscriptionRef"
+            },
+            "schemaRef": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "title": "result",
+          "required": [
+            "id",
+            "type",
+            "payload"
+          ],
+          "additionalProperties": false,
+          "description": "Generic response for the query RPCs, correlated by id.",
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "result"
+            },
+            "payload": {},
+            "partial": {
+              "type": "boolean",
+              "description": "True for non-final frames of a streamed export or scan."
+            }
+          }
+        },
+        {
+          "title": "rowDelta",
+          "description": "Rows that changed in a live table. An EVENT, not a reply: it is unsolicited and carries no correlated request id.",
+          "required": [
+            "id",
+            "type",
+            "ref",
+            "columns"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "rowDelta"
+            },
+            "ref": {
+              "$ref": "#/$defs/subscriptionRef"
+            },
+            "columns": {
+              "type": "object",
+              "description": "Column-oriented block of changed rows."
+            },
+            "rows": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "seq": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Monotonic per subscriber. Echoed back in `ack` so the hub can measure how far behind this subscriber is."
+            }
+          }
+        },
+        {
+          "title": "alert",
+          "required": [
+            "id",
+            "type",
+            "ruleId",
+            "row"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "alert"
+            },
+            "ruleId": {
+              "type": "string"
+            },
+            "row": {
+              "type": "object"
+            },
+            "firedAt": {
+              "type": "string",
+              "format": "date-time"
+            }
+          }
+        },
+        {
+          "title": "commandResult",
+          "required": [
+            "id",
+            "type",
+            "idempotencyKey",
+            "outcome"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "commandResult"
+            },
+            "idempotencyKey": {
+              "type": "string"
+            },
+            "outcome": {
+              "enum": [
+                "applied",
+                "rejected",
+                "duplicate",
+                "unknown"
+              ]
+            },
+            "detail": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "title": "statsTick",
+          "required": [
+            "id",
+            "type",
+            "datasources"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "statsTick"
+            },
+            "processMemoryBytes": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "processCeilingBytes": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Diagnostics must be able to answer 'why was I refused' (architecture \u00a76.2)."
+            },
+            "datasources": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "datasourceId",
+                  "state"
+                ],
+                "additionalProperties": false,
+                "properties": {
+                  "datasourceId": {
+                    "type": "string"
+                  },
+                  "state": {
+                    "$ref": "#/$defs/state"
+                  },
+                  "msgsInPerSec": {
+                    "type": "number"
+                  },
+                  "msgsOutPerSec": {
+                    "type": "number"
+                  },
+                  "conflationRatio": {
+                    "type": "number"
+                  },
+                  "cacheRows": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "memoryBytes": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "subscribers": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "openViews": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "backpressureRung": {
+                    "enum": [
+                      "none",
+                      "conflating",
+                      "snapshot-refresh",
+                      "disconnecting"
+                    ]
+                  },
+                  "lastError": {
+                    "type": "string"
+                  },
+                  "configVersion": {
+                    "type": "integer",
+                    "minimum": 0
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "title": "error",
+          "required": [
+            "id",
+            "type",
+            "code",
+            "message"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "error"
+            },
+            "code": {
+              "$ref": "#/$defs/errorCode"
+            },
+            "message": {
+              "type": "string"
+            },
+            "ref": {
+              "$ref": "#/$defs/subscriptionRef"
+            },
+            "retryable": {
+              "type": "boolean"
+            }
+          }
+        },
+        {
+          "title": "refresh",
+          "required": [
+            "id",
+            "type",
+            "ref"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "refresh"
+            },
+            "ref": {
+              "$ref": "#/$defs/subscriptionRef"
+            },
+            "reason": {
+              "enum": [
+                "backpressure",
+                "schema-change",
+                "reconnect"
+              ]
+            },
+            "detail": {
+              "type": "string"
+            }
+          },
+          "description": "Stop expecting row deltas and re-read the view. Sent when a subscriber has fallen far enough behind that sending it more rows cannot help."
+        },
+        {
+          "title": "groupDelta",
+          "required": [
+            "id",
+            "type",
+            "ref",
+            "changed"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "groupDelta"
+            },
+            "ref": {
+              "$ref": "#/$defs/subscriptionRef"
+            },
+            "groupBy": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "changed": {
+              "type": "array",
+              "items": {
+                "type": "object"
+              }
+            }
+          },
+          "description": "Group aggregates that moved (Phase 8e)."
+        }
+      ]
+    }
+  }
+}

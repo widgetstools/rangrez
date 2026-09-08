@@ -1,0 +1,12 @@
+{
+  "name": "@wellsfargo-starui/demo",
+  "version": "0.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "node src/index.js",
+    "build": "echo \"No build step yet\"",
+    "lint": "echo \"No lint step yet\"",
+    "test": "echo \"No tests yet\"",
+    "clean": "rm -rf dist"
+  }
+}

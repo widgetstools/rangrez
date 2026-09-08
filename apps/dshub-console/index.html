@@ -1,0 +1,58 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>DataSource Hub — console</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin:0; background:#14181d; color:#e7eaed; font:13px ui-monospace,Menlo,monospace; }
+  header { padding:10px 14px; border-bottom:1px solid #2b3138; display:flex; gap:16px; align-items:center; }
+  h1 { font-size:14px; margin:0; font-weight:600; }
+  .conn { color:#8a939c; } .conn b { color:#7fd18a; }
+</style>
+
+<header>
+  <h1>hub console</h1>
+  <span class="conn">worker <b id="conn">connecting…</b></span>
+  <span class="conn">ticks <b id="ticks">0</b></span>
+</header>
+<div id="diag"></div>
+
+<script type="module">
+import { mount } from '/packages/dshub-admin/src/diagnostics.mjs';
+import { Transport } from '/packages/dshub-provider/src/transport.mjs';
+import { ControlClient } from '/packages/dshub-provider/src/control.mjs';
+
+const v = new URLSearchParams(location.search).get('v') ?? 'blotter14';
+const worker = new SharedWorker(`/apps/dshub-spike/web/dshub.worker.mjs?v=${v}`, { type: 'module', name: `dshub-${v}` });
+
+const screen = mount(document.getElementById('diag'));
+window.__diag = { ticks: 0, last: null };
+
+const control = new ControlClient({ send: (m) => transport.send(m) });
+const transport = new Transport({
+  connect: () => worker.port,
+  onControl: (m) => {
+    if (m.type === 'result' && m.payload?.ready) {
+      document.getElementById('conn').textContent = `session ${m.payload.sessionId}`;
+      control.hello({ appId: 'console' }).catch(() => {});
+      return;
+    }
+    control.handle(m);
+  },
+});
+transport.open();
+
+// statsTick is pushed, not polled — every session sees the same numbers at the
+// same moment.
+control.on('statsTick', (tick) => {
+  window.__diag.ticks++;
+  window.__diag.last = tick;
+  document.getElementById('ticks').textContent = window.__diag.ticks;
+  screen.update(tick);
+});
+
+// Fall back to a pull if nothing is pushing yet.
+setInterval(async () => {
+  if (window.__diag.ticks > 0) return;
+  try { screen.update((await control.getStats()).payload); } catch {}
+}, 2000);
+</script>

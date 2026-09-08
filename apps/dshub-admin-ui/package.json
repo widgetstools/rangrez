@@ -1,0 +1,12 @@
+{
+  "name": "@wellsfargo-starui/dshub-admin-ui",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "echo static-html",
+    "lint": "echo no-lint-yet",
+    "test": "echo no-tests-yet",
+    "clean": "echo nothing-to-clean"
+  }
+}

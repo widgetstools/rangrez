@@ -1,0 +1,201 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>DataSource Hub — VRM blotter</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin:0; font:13px ui-monospace,Menlo,monospace; background:#14181d; color:#e7eaed;
+         display:flex; flex-direction:column; height:100vh; }
+  header { padding:8px 14px; border-bottom:1px solid #2b3138; display:flex; gap:18px; align-items:center; flex-wrap:wrap; }
+  h1 { font-size:14px; margin:0; font-weight:600; }
+  .stat { color:#8a939c; } .stat b { color:#e7eaed; font-weight:600; }
+  .badge { padding:2px 8px; border-radius:2px; font-size:11px; letter-spacing:.08em; text-transform:uppercase; }
+  .live{background:#16321f;color:#7fd18a} .failed{background:#331c19;color:#e8776a} .loading{background:#1b2733;color:#7eb2d1}
+  #grid { flex:1; min-height:0; }
+</style>
+
+<header>
+  <h1>positions — VRM</h1>
+  <span id="state" class="badge loading">connecting</span>
+  <span class="stat">server rows <b id="rows">–</b></span>
+  <span class="stat">window fetches <b id="reqs">0</b></span>
+  <span class="stat">views open <b id="views">0</b></span>
+  <span class="stat">rows cached <b id="evicted">0</b></span>
+  <span class="stat">fetch p50 <b id="p50">–</b></span>
+  <span class="stat">deltas <b id="deltas">0</b></span>
+  <span class="stat">refreshes <b id="refreshes">0</b></span>
+  <span class="stat">delta wire <b id="dbytes">0kB</b></span>
+  <span class="stat" id="err" style="color:#e8776a"></span>
+</header>
+<div id="grid"></div>
+
+<script type="importmap">
+{
+  "imports": {
+    "ag-stack": "/node_modules/ag-stack/dist/package/main.esm.mjs",
+    "ag-grid-community": "/node_modules/ag-grid-community/dist/package/main.esm.mjs",
+    "ag-grid-enterprise": "/node_modules/ag-grid-enterprise/dist/package/main.esm.mjs"
+  }
+}
+</script>
+
+<script type="module">
+import { ModuleRegistry, createGrid, themeQuartz, colorSchemeDark, iconSetQuartzBold } from 'ag-grid-community';
+import { AllEnterpriseModule } from 'ag-grid-enterprise';
+import { buildColDefs } from '/packages/dshub-provider/src/coldefs.mjs';
+import { HubDataService } from '/packages/dshub-provider/src/hubDataService.mjs';
+import { VrmMode, treeCellRenderer } from '/packages/dshub-provider/src/modes/vrm.mjs';
+import { Transport } from '/packages/dshub-provider/src/transport.mjs';
+import { ControlClient } from '/packages/dshub-provider/src/control.mjs';
+
+// SSRM is Enterprise (ServerSideRowModelModule), as is the set filter the
+// artifact-driven colDefs emit.
+ModuleRegistry.registerModules([AllEnterpriseModule]);
+
+const $ = (id) => document.getElementById(id);
+const setState = (s, cls) => { $('state').textContent = s; $('state').className = 'badge ' + (cls ?? 'loading'); };
+const blockMs = [];
+const p50 = () => { if (!blockMs.length) return '–'; const s=[...blockMs].sort((a,b)=>a-b); return s[Math.floor(s.length/2)].toFixed(0)+'ms'; };
+
+window.__ssrm = { failures: 0, requests: 0, groupRequests: 0, leafRequests: 0, errors: [], rowCount: null,
+                  viewsOpened: 0, evictions: 0, states: [], ready: false };
+
+const REF = { datasourceId: 'positions', params: { clientId: 'trd1', rate: 2000, batchSize: 10 } };
+const artifact = await (await fetch('/packages/dshub-spec/corpus/positions/artifact.json')).json();
+
+const v = new URLSearchParams(location.search).get('v') ?? 'vrm1';
+const worker = new SharedWorker(`/apps/dshub-spike/web/dshub.worker.mjs?v=${v}`, { type: 'module', name: `dshub-${v}` });
+
+const control = new ControlClient({ send: (m) => transport.send(m), timeoutMs: 60_000 });
+const transport = new Transport({
+  connect: () => worker.port,
+  onControl: (m) => { if (m.type === 'result' && m.payload?.ready) { boot(); return; } control.handle(m); },
+  onState: (s) => { if (s === 'disconnected') control.failAll(); },
+});
+transport.open();
+
+let resolveLive; const liveOnce = new Promise((r) => { resolveLive = r; });
+
+// Measure what a delta actually costs us, so the "only the viewport crosses the
+// wire" claim is visible on screen instead of taken on trust.
+let deltas = 0, deltaRows = 0, deltaBytes = 0;
+control.on('rowDelta', (m) => {
+  deltas++;
+  deltaRows += m.rows ?? 0;
+  deltaBytes += JSON.stringify(m).length;
+});
+control.on('state', (m) => { window.__ssrm.states.push(m.state); if (m.state === 'live') resolveLive?.(); });
+
+const dataService = new HubDataService({
+  control, ref: REF, artifact, mode: 'ssrm',
+  keyColumns: ['positionId'], softDeleteColumn: '_deleted',
+  searchColumns: ['desk', 'trader', 'bookName'],
+});
+
+// Count what the mode actually does, so the demo shows the view cache working.
+const origOpen = dataService.openView.bind(dataService);
+dataService.openView = async (spec) => { window.__ssrm.viewsOpened++; return origOpen(spec); };
+
+window.__svc = dataService;
+// exposed so the harness can drive the mode directly
+setTimeout(() => { window.__vrmInstance = vrm; }, 0);
+
+// ONE view for the whole tree. Two group levels so the tree has depth to
+// exercise; SSRM would open a view per expanded node for the same shape.
+const vrm = new VrmMode({
+  dataService, artifact,
+  viewSpec: { groupBy: ['desk', 'trader'], aggregates: { marketValue: 'sum', notionalAmount: 'sum', dv01: 'sum' }, depth: 1 },
+  bufferRows: 60,
+});
+
+// Group-capable columns first, so the tree is easy to exercise.
+// VRM has no native grouping UI — the tree column is rendered from
+// __ROW_PATH__ by our own cell renderer. That is one of VRM's real costs.
+const money = (p) => (p.value == null ? '' : Number(p.value).toLocaleString(undefined, { maximumFractionDigits: 0 }));
+const colDefs = [
+  { colId: 'tree', headerName: 'Desk / Trader', minWidth: 300, flex: 2,
+    cellRenderer: treeCellRenderer({ onToggle: (index, data) => vrm.toggle(index, data) }) },
+  { colId: 'marketValue', field: 'marketValue', headerName: 'Market Value', type: 'rightAligned', valueFormatter: money },
+  { colId: 'notionalAmount', field: 'notionalAmount', headerName: 'Notional', type: 'rightAligned', valueFormatter: money },
+  { colId: 'dv01', field: 'dv01', headerName: 'DV01', type: 'rightAligned', valueFormatter: money },
+];
+
+const theme = themeQuartz.withPart(colorSchemeDark).withPart(iconSetQuartzBold).withParams({
+  backgroundColor: '#14181d', foregroundColor: '#e7eaed', borderColor: '#2b3138',
+  headerBackgroundColor: '#1a1e23', headerTextColor: '#8a939c', oddRowBackgroundColor: '#171b21',
+  rowHoverColor: '#1e242b', accentColor: '#e5a244',
+  fontFamily: 'ui-monospace, Menlo, monospace', fontSize: 12, headerFontSize: 11,
+  rowHeight: 26, headerHeight: 30, cellHorizontalPadding: 8,
+});
+
+const gridApi = createGrid($('grid'), {
+  theme,
+  columnDefs: colDefs,
+  rowModelType: 'viewport',
+  defaultColDef: { resizable: true, minWidth: 120 },
+  // Rows fetched either side of the viewport, so a small scroll does not
+  // immediately trigger another round trip.
+  viewportRowModelBufferSize: 60,
+  viewportRowModelPageSize: 40,
+});
+
+async function boot() {
+  if (window.__ssrm.ready) return;
+  window.__ssrm.ready = true;
+  try {
+    await control.hello({ appId: 'vrm-blotter' });
+    // `notify`: VRM re-reads its own viewport, so the hub sends a count rather
+    // than the delta rows. Shipping them would put the entire feed on the wire
+    // to be decoded and discarded — the exact cost this mode exists to avoid.
+    await control.subscribe(REF, { delivery: 'notify' });
+    setState('snapshotting');
+    await Promise.race([
+      liveOnce,
+      new Promise((_, rej) => setTimeout(() => rej(new Error('no live state within 60s')), 60_000)),
+    ]);
+    setState('live', 'live');
+
+    window.__ssrm.rowCount = (await control.rowCount(REF, {})).payload;
+    $('rows').textContent = Number(window.__ssrm.rowCount).toLocaleString();
+
+    // Only now attach the datasource: SSRM starts fetching immediately, and
+    // fetching before `live` reads an empty table.
+    gridApi.setGridOption('viewportDatasource', instrumented(vrm.datasource()));
+
+    // Live: every upstream delta refreshes the ~40 rows on screen, coalesced to
+    // one window read per interval.
+    vrm.attach(control);
+  } catch (e) {
+    $('err').textContent = String(e.message ?? e).slice(0, 140);
+    window.__ssrm.errors.push(String(e.message ?? e));
+    setState('failed', 'failed');
+  }
+}
+
+/** Wrap the viewport datasource so the demo can show fetch counts and latency. */
+function instrumented(ds) {
+  return {
+    ...ds,
+    setViewportRange: async (first, last) => {
+      const t0 = performance.now();
+      window.__ssrm.requests++;
+      await ds.setViewportRange(first, last);
+      blockMs.push(performance.now() - t0);
+      if (blockMs.length > 200) blockMs.shift();
+    },
+  };
+}
+
+setInterval(() => {
+  $('reqs').textContent = vrm.fetches;
+  $('views').textContent = vrm.handle ? 1 : 0;
+  $('evicted').textContent = vrm.rowsByIndex.size;
+  $('p50').textContent = p50();
+  $('deltas').textContent = deltas.toLocaleString();
+  $('refreshes').textContent = vrm.refreshes.toLocaleString();
+  $('dbytes').textContent = deltaBytes > 1e6
+    ? (deltaBytes / 1e6).toFixed(1) + 'MB' : (deltaBytes / 1e3).toFixed(0) + 'kB';
+  window.__vrm = { fetches: vrm.fetches, pushes: vrm.pushes, rowCount: vrm.rowCount,
+                   deltas, deltaRows, deltaBytes, refreshes: vrm.refreshes,
+                   viewsOpen: vrm.handle ? 1 : 0, cached: vrm.rowsByIndex.size };
+}, 500);
+</script>

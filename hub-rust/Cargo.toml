@@ -1,0 +1,50 @@
+[package]
+name = "dshub-hub-rust"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.78"
+description = "The DataSource Hub, native host: a custom cache + query engine over socket.io. Multi-tenant, SSRM-first."
+
+# NO perspective-server: it is edition 2024 (needs Rust >= 1.85) on every version,
+# and this project pins 1.78. The hub is a cache-and-publish layer, so it runs a
+# purpose-built query engine (store.rs + query.rs) instead of a general analytics
+# engine. Parity with the JS/Perspective path is proven by the conformance corpus.
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["preserve_order"] }
+# Ordered maps for row/column objects, and pinned pre-edition-2024 so the graph
+# stays buildable on Rust 1.78 (latest indexmap/hashbrown are edition 2024).
+indexmap = { version = "=2.2.6", features = ["serde"] }
+hashbrown = "=0.14.5"
+# Sync WebSocket for the runnable server (MSRV 1.71). No async runtime needed:
+# thread-per-connection feeds Endpoint::on_text and writes the frames back.
+# The ONLY non-wasm dependency — optional so the wasm build drops it (and its
+# whole native subtree: getrandom/libc/…).
+tungstenite = { version = "0.29", default-features = false, features = ["handshake"], optional = true }
+# Only under the `wasm` feature: the JS boundary for the in-browser Web Worker
+# build. MSRV 1.76, so it builds on the pinned 1.78; no edition-2024 dep added.
+wasm-bindgen = { version = "=0.2.100", optional = true }
+
+[features]
+# The native sidecar (default): sockets + threads via tungstenite.
+default = ["native"]
+native = ["dep:tungstenite"]
+# The in-browser build: the same hub compiled to wasm, driven over a MessagePort.
+wasm = ["dep:wasm-bindgen"]
+
+[lib]
+name = "dshub"
+path = "src/lib.rs"
+# cdylib for the wasm-bindgen output; rlib keeps the native lib + tests + bin.
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "dshub-sidecar-rs"
+path = "src/main.rs"
+# The process entry point is native-only; the wasm build skips it entirely.
+required-features = ["native"]
+
+[profile.release]
+lto = true
+codegen-units = 1

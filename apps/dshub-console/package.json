@@ -1,0 +1,22 @@
+{
+  "name": "@wellsfargo-starui/dshub-console",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "echo no-typescript-yet",
+    "dev": "echo no-dev-yet",
+    "lint": "echo no-lint-yet",
+    "test": "echo no-tests-yet",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "@wellsfargo-starui/dshub-admin": "*"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0"
+  }
+}

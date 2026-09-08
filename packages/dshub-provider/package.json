@@ -1,0 +1,17 @@
+{
+  "name": "@wellsfargo-starui/dshub-provider",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "build": "echo no-typescript-yet",
+    "lint": "echo no-lint-yet",
+    "test": "node --test 'test/*.test.mjs'",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "ag-grid-community": "36.0.0",
+    "ag-grid-enterprise": "36.0.0"
+  }
+}

@@ -1,0 +1,813 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wellsfargo-starui/dshub/datasource-config.schema.json",
+  "title": "DataSource Hub configuration bundle",
+  "description": "Connection profiles and datasource definitions. Every leaf carries x-reloadClass (architecture \u00a73.8) so hot-reload behaviour is derived from the spec rather than decided ad hoc.",
+  "specVersion": "1.0",
+  "type": "object",
+  "required": [
+    "specVersion",
+    "connections",
+    "datasources"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "specVersion": {
+      "type": "string",
+      "const": "1.0"
+    },
+    "connections": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/connection"
+      }
+    },
+    "datasources": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/datasource"
+      }
+    }
+  },
+  "$defs": {
+    "reloadClass": {
+      "description": "live=applied in place \u00b7 resubscribe=drop and re-establish upstream \u00b7 rebuild=destroy and recreate the table \u00b7 restart=host restart required",
+      "enum": [
+        "live",
+        "resubscribe",
+        "rebuild",
+        "restart"
+      ]
+    },
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[a-z0-9][a-z0-9.-]*$",
+      "description": "Lowercase id; dots and dashes allowed after the first character (names like \"test.dp\" are the working convention)."
+    },
+    "connection": {
+      "type": "object",
+      "required": [
+        "id",
+        "kind",
+        "url"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id",
+          "x-reloadClass": "restart"
+        },
+        "kind": {
+          "enum": [
+            "stomp",
+            "ws",
+            "socketio",
+            "rest",
+            "amps",
+            "solace"
+          ],
+          "x-reloadClass": "restart",
+          "description": "amps and solace are reachable only from the Rust sidecar (architecture \u00a72.2) and cannot be served by the worker host."
+        },
+        "url": {
+          "type": "string",
+          "format": "uri",
+          "x-reloadClass": "resubscribe"
+        },
+        "vhost": {
+          "type": "string",
+          "x-reloadClass": "resubscribe"
+        },
+        "heartbeat": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "outMs": {
+              "type": "integer",
+              "minimum": 0,
+              "x-reloadClass": "resubscribe"
+            },
+            "inMs": {
+              "type": "integer",
+              "minimum": 0,
+              "x-reloadClass": "resubscribe"
+            }
+          }
+        },
+        "auth": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "mode": {
+              "enum": [
+                "token-from-app",
+                "none"
+              ],
+              "x-reloadClass": "restart"
+            }
+          }
+        },
+        "credentialRef": {
+          "type": "string",
+          "x-reloadClass": "resubscribe",
+          "description": "Opaque reference only. A literal secret here is rejected on write, export and import (architecture \u00a73.9)."
+        },
+        "reconnect": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "initialMs": {
+              "type": "integer",
+              "minimum": 0,
+              "x-reloadClass": "live"
+            },
+            "maxMs": {
+              "type": "integer",
+              "minimum": 0,
+              "x-reloadClass": "live"
+            },
+            "factor": {
+              "type": "number",
+              "minimum": 1,
+              "x-reloadClass": "live"
+            },
+            "maxAttempts": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0,
+              "x-reloadClass": "live"
+            }
+          }
+        },
+        "failover": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "format": "uri"
+          },
+          "x-reloadClass": "resubscribe"
+        },
+        "tls": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "verify": {
+              "type": "boolean",
+              "x-reloadClass": "restart"
+            },
+            "caRef": {
+              "type": "string",
+              "x-reloadClass": "restart"
+            }
+          }
+        },
+        "updatesUrl": {
+          "type": "string",
+          "format": "uri",
+          "x-reloadClass": "resubscribe",
+          "description": "Where UPDATES arrive when the snapshot uses a different protocol. `rest-then-subscribe` fetches its snapshot over HTTP and must then subscribe somewhere else; without this the only URL available is the REST base, which is not a socket endpoint."
+        },
+        "updatesKind": {
+          "enum": [
+            "stomp",
+            "ws",
+            "socketio"
+          ],
+          "x-reloadClass": "restart",
+          "description": "Transport carrying updates for a rest-then-subscribe datasource. Defaults to `ws`. REST cannot carry its own updates, so this is never `rest`."
+        }
+      }
+    },
+    "datasource": {
+      "type": "object",
+      "required": [
+        "id",
+        "connectionRef",
+        "schemaRef",
+        "snapshot",
+        "keyColumns"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id",
+          "x-reloadClass": "rebuild"
+        },
+        "connectionRef": {
+          "$ref": "#/$defs/id",
+          "x-reloadClass": "resubscribe"
+        },
+        "schemaRef": {
+          "type": "string",
+          "pattern": "^[a-z0-9.-]+@v[0-9]+$",
+          "x-reloadClass": "rebuild"
+        },
+        "snapshot": {
+          "$ref": "#/$defs/snapshot"
+        },
+        "updates": {
+          "$ref": "#/$defs/updates"
+        },
+        "keyColumns": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string"
+          },
+          "x-reloadClass": "rebuild",
+          "description": "Perspective index columns. Encoded with \\u0001 as separator when composite (parity study \u00a72.3)."
+        },
+        "opField": {
+          "type": "object",
+          "required": [
+            "path",
+            "map"
+          ],
+          "additionalProperties": false,
+          "x-reloadClass": "rebuild",
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "map": {
+              "type": "object",
+              "additionalProperties": {
+                "enum": [
+                  "insert",
+                  "update",
+                  "delete"
+                ]
+              }
+            }
+          }
+        },
+        "softDelete": {
+          "type": "object",
+          "required": [
+            "column"
+          ],
+          "additionalProperties": false,
+          "description": "Perspective on_update does not surface removals (architecture \u00a78.4); a delete becomes a flag flip the delta can carry.",
+          "properties": {
+            "column": {
+              "type": "string",
+              "x-reloadClass": "rebuild"
+            },
+            "reapAfterMs": {
+              "type": "integer",
+              "minimum": 0,
+              "x-reloadClass": "live"
+            }
+          }
+        },
+        "flatten": {
+          "$ref": "#/$defs/flatten"
+        },
+        "coercions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/coercion"
+          },
+          "x-reloadClass": "rebuild"
+        },
+        "batch": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "maxMs": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1000,
+              "x-reloadClass": "live"
+            },
+            "maxRows": {
+              "type": "integer",
+              "minimum": 1,
+              "x-reloadClass": "live"
+            },
+            "dedupeByKey": {
+              "type": "boolean",
+              "x-reloadClass": "live"
+            }
+          }
+        },
+        "conflation": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "defaultIntervalMs": {
+              "type": "integer",
+              "minimum": 0,
+              "x-reloadClass": "live"
+            },
+            "maxIntervalMs": {
+              "type": "integer",
+              "minimum": 0,
+              "x-reloadClass": "live"
+            }
+          }
+        },
+        "params": {
+          "type": "object",
+          "x-reloadClass": "resubscribe",
+          "additionalProperties": {
+            "type": "object",
+            "required": [
+              "type"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "type": {
+                "enum": [
+                  "string",
+                  "number",
+                  "boolean"
+                ]
+              },
+              "required": {
+                "type": "boolean"
+              },
+              "default": {}
+            }
+          }
+        },
+        "sharing": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "strategy": {
+              "enum": [
+                "none",
+                "superset"
+              ],
+              "x-reloadClass": "rebuild"
+            },
+            "supersetParams": {
+              "type": "object",
+              "x-reloadClass": "rebuild"
+            }
+          }
+        },
+        "lifecycle": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "prewarm": {
+              "type": "boolean",
+              "x-reloadClass": "live"
+            },
+            "idleTeardownMs": {
+              "type": "integer",
+              "minimum": 0,
+              "x-reloadClass": "live"
+            },
+            "maxRows": {
+              "type": "integer",
+              "minimum": 1,
+              "x-reloadClass": "live",
+              "description": "Per-table hard guard. Not sufficient alone \u2014 see the process ceiling in architecture \u00a76.2."
+            }
+          }
+        }
+      }
+    },
+    "updates": {
+      "type": "object",
+      "required": [
+        "destination"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "destination": {
+          "type": "string",
+          "x-reloadClass": "resubscribe"
+        },
+        "selector": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-reloadClass": "resubscribe"
+        },
+        "bodyShape": {
+          "enum": [
+            "record",
+            "record-array"
+          ],
+          "x-reloadClass": "resubscribe",
+          "description": "Whether one frame body is a single record or a JSON array of them. The local STOMP view server batches ~10 records per frame."
+        },
+        "subscribeBeforeSnapshot": {
+          "type": "boolean",
+          "x-reloadClass": "resubscribe",
+          "description": "Must be true in practice \u2014 subscribing after the snapshot leaves a gap (architecture \u00a75.5)."
+        },
+        "updatesDuringSnapshot": {
+          "enum": [
+            "buffer",
+            "apply-live",
+            "none-expected"
+          ],
+          "x-reloadClass": "resubscribe"
+        }
+      }
+    },
+    "snapshot": {
+      "type": "object",
+      "required": [
+        "mode"
+      ],
+      "x-reloadClass": "resubscribe",
+      "description": "Discriminated union on mode (architecture \u00a73.4).",
+      "oneOf": [
+        {
+          "title": "trigger-reply",
+          "required": [
+            "mode",
+            "triggerDestination",
+            "replyDestination",
+            "endOfSnapshot"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "mode": {
+              "const": "trigger-reply"
+            },
+            "triggerDestination": {
+              "type": "string"
+            },
+            "triggerBody": {},
+            "replyDestination": {
+              "type": "string"
+            },
+            "correlationHeader": {
+              "type": "string"
+            },
+            "endOfSnapshot": {
+              "$ref": "#/$defs/endOfSnapshot"
+            },
+            "expectedCountHeader": {
+              "type": "string"
+            },
+            "timeoutMs": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "quietPeriodMs": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            }
+          }
+        },
+        {
+          "title": "rest-then-subscribe",
+          "required": [
+            "mode",
+            "url",
+            "endOfSnapshot"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "mode": {
+              "const": "rest-then-subscribe"
+            },
+            "url": {
+              "type": "string"
+            },
+            "method": {
+              "enum": [
+                "GET",
+                "POST"
+              ]
+            },
+            "headers": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            },
+            "pagination": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "style": {
+                  "enum": [
+                    "offset",
+                    "cursor",
+                    "none"
+                  ]
+                },
+                "pageSize": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "cursorPath": {
+                  "type": "string"
+                }
+              }
+            },
+            "endOfSnapshot": {
+              "$ref": "#/$defs/endOfSnapshot"
+            },
+            "expectedCountHeader": {
+              "type": "string"
+            },
+            "timeoutMs": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "quietPeriodMs": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            }
+          }
+        },
+        {
+          "title": "subscribe-with-replay",
+          "required": [
+            "mode",
+            "replayFrom",
+            "endOfSnapshot"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "mode": {
+              "const": "subscribe-with-replay"
+            },
+            "replayFrom": {
+              "type": "string"
+            },
+            "endOfSnapshot": {
+              "$ref": "#/$defs/endOfSnapshot"
+            },
+            "expectedCountHeader": {
+              "type": "string"
+            },
+            "timeoutMs": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "quietPeriodMs": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            }
+          }
+        },
+        {
+          "title": "subscribe-only",
+          "required": [
+            "mode"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "mode": {
+              "const": "subscribe-only"
+            },
+            "endOfSnapshot": {
+              "$ref": "#/$defs/endOfSnapshot"
+            },
+            "expectedCountHeader": {
+              "type": "string"
+            },
+            "timeoutMs": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "quietPeriodMs": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            }
+          }
+        },
+        {
+          "title": "file-seed",
+          "required": [
+            "mode",
+            "path"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "mode": {
+              "const": "file-seed"
+            },
+            "path": {
+              "type": "string"
+            },
+            "endOfSnapshot": {
+              "$ref": "#/$defs/endOfSnapshot"
+            },
+            "expectedCountHeader": {
+              "type": "string"
+            },
+            "timeoutMs": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "quietPeriodMs": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            }
+          }
+        }
+      ]
+    },
+    "endOfSnapshot": {
+      "type": "object",
+      "required": [
+        "kind"
+      ],
+      "description": "A missing sentinel must fail the subscription loudly. Going live with a silently truncated book is the worst failure in this system (architecture \u00a73.4).",
+      "oneOf": [
+        {
+          "title": "sentinel-header",
+          "required": [
+            "kind",
+            "header",
+            "value"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "sentinel-header"
+            },
+            "header": {
+              "type": "string"
+            },
+            "value": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "title": "sentinel-body",
+          "required": [
+            "kind",
+            "path",
+            "value"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "sentinel-body"
+            },
+            "path": {
+              "type": "string"
+            },
+            "value": {}
+          }
+        },
+        {
+          "title": "sentinel-substring",
+          "description": "Case-insensitive substring of the frame body. Weaker than a header sentinel \u2014 prefer sentinel-header when the broker sets one \u2014 but some brokers only mark completion in prose.",
+          "required": [
+            "kind",
+            "value"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "sentinel-substring"
+            },
+            "value": {
+              "type": "string",
+              "minLength": 1
+            },
+            "caseSensitive": {
+              "type": "boolean"
+            }
+          }
+        },
+        {
+          "title": "count-reached",
+          "required": [
+            "kind"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "count-reached"
+            }
+          }
+        },
+        {
+          "title": "stream-end",
+          "required": [
+            "kind"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "stream-end"
+            }
+          }
+        }
+      ]
+    },
+    "flatten": {
+      "type": "object",
+      "additionalProperties": false,
+      "x-reloadClass": "rebuild",
+      "properties": {
+        "separator": {
+          "type": "string",
+          "enum": [
+            "_",
+            "/",
+            "-",
+            ":"
+          ],
+          "description": "'.' is deliberately excluded: AG-Grid resolves a dotted ColDef field as a deep property path and fails silently (architecture \u00a75.2)."
+        },
+        "maxDepth": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 16
+        },
+        "arrays": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "required": [
+              "strategy"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "strategy": {
+                "enum": [
+                  "index-pin",
+                  "aggregate",
+                  "json-string",
+                  "explode"
+                ]
+              },
+              "arity": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "aggregate": {
+                "enum": [
+                  "count",
+                  "sum",
+                  "min",
+                  "max"
+                ]
+              },
+              "aggregatePath": {
+                "type": "string"
+              },
+              "childTable": {
+                "$ref": "#/$defs/id"
+              }
+            }
+          }
+        }
+      }
+    },
+    "coercion": {
+      "type": "object",
+      "required": [
+        "path",
+        "kind"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "ticks-to-decimal",
+            "string-to-number",
+            "epoch-to-datetime",
+            "scaled-integer"
+          ]
+        },
+        "companion": {
+          "type": "string",
+          "description": "Companion numeric column name. 32nds prices must stay strings with a numeric twin, or sorting and aggregation break (architecture \u00a74.2)."
+        },
+        "scale": {
+          "type": "number"
+        }
+      }
+    }
+  }
+}

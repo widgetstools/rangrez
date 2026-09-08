@@ -1,0 +1,308 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>DataSource Hub — blotter</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin:0; font:13px ui-monospace,Menlo,monospace; background:#14181d; color:#e7eaed;
+         display:flex; flex-direction:column; height:100vh; }
+  header { padding:8px 14px; border-bottom:1px solid #2b3138; display:flex; gap:18px; align-items:center; flex-wrap:wrap; }
+  h1 { font-size:14px; margin:0; font-weight:600; letter-spacing:-.01em; }
+  .stat { color:#8a939c; } .stat b { color:#e7eaed; font-weight:600; }
+  .badge { padding:2px 8px; border-radius:2px; font-size:11px; letter-spacing:.08em; text-transform:uppercase; }
+  .live{background:#16321f;color:#7fd18a} .stale{background:#332b16;color:#e5a244}
+  .failed{background:#331c19;color:#e8776a} .loading{background:#1b2733;color:#7eb2d1}
+  #grid { flex:1; min-height:0; }
+</style>
+
+<header>
+  <h1 id="dsname">positions</h1>
+  <span id="state" class="badge loading">connecting</span>
+  <span class="stat">rows <b id="rows">0</b></span>
+  <span class="stat">updates <b id="applied">0</b></span>
+  <span class="stat">removed <b id="removed">0</b></span>
+  <span class="stat">apply p50 <b id="p50">–</b></span>
+  <span class="stat">mode <b id="mode">–</b></span>
+  <span class="stat" id="err" style="color:#e8776a"></span>
+</header>
+<div id="grid"></div>
+
+<!--
+  AG-Grid's ESM build imports `ag-stack` by bare specifier, which a browser
+  cannot resolve on its own. An import map handles it in a page. Note this does
+  NOT work inside a worker — import maps do not apply there, which is why the
+  worker uses absolute paths throughout.
+-->
+<script type="importmap">
+{
+  "imports": {
+    "ag-stack": "/node_modules/ag-stack/dist/package/main.esm.mjs",
+    "ag-grid-community": "/node_modules/ag-grid-community/dist/package/main.esm.mjs",
+    "ag-grid-enterprise": "/node_modules/ag-grid-enterprise/dist/package/main.esm.mjs"
+  }
+}
+</script>
+
+<script type="module">
+import { ModuleRegistry, createGrid, themeQuartz, colorSchemeDark, iconSetQuartzBold } from 'ag-grid-community';
+import { AllEnterpriseModule } from 'ag-grid-enterprise';
+import { buildColDefs, selectMode } from '/packages/dshub-provider/src/coldefs.mjs';
+import { CsrmDataService } from '/packages/dshub-provider/src/dataService.mjs';
+import { CsrmMode } from '/packages/dshub-provider/src/modes/csrm.mjs';
+import { Transport } from '/packages/dshub-provider/src/transport.mjs';
+import { ControlClient } from '/packages/dshub-provider/src/control.mjs';
+
+/**
+ * ENTERPRISE modules are required, not optional.
+ *
+ * The colDefs are generated from the schema artifact, and that generation emits
+ * `agSetColumnFilter` (cardinality < 10k) and `enableValue` on numerics — both
+ * AG-Grid Enterprise features. With only AllCommunityModule registered the grid
+ * logs error #200 and refuses to build its body at all: no `.ag-body-viewport`,
+ * no rows, and no obvious connection to the cause.
+ *
+ * So artifact-driven colDefs imply an Enterprise licence. Worth knowing before
+ * a desk discovers it.
+ */
+ModuleRegistry.registerModules([AllEnterpriseModule]);
+
+const $ = (id) => document.getElementById(id);
+const setState = (s) => {
+  const el = $('state');
+  el.textContent = s;
+  el.className = 'badge ' + (s === 'live' ? 'live' : s === 'stale' ? 'stale' : s === 'failed' ? 'failed' : 'loading');
+};
+
+const latencies = [];
+const p50 = () => {
+  if (!latencies.length) return '–';
+  const s = [...latencies].sort((a, b) => a - b);
+  return s[Math.floor(s.length / 2)].toFixed(1) + 'ms';
+};
+
+window.__blotter = { rows: 0, applied: 0, removed: 0, states: [], errors: [], ready: false, colDefs: 0 };
+
+/**
+ * The artifact for THIS datasource, from the config store first — an
+ * admin-onboarded datasource ("test.dp") has its schema in IndexedDB, not in a
+ * checked-in file. The static corpus artifact stays as the seed fallback.
+ */
+const DS = new URLSearchParams(location.search).get('ds') ?? 'positions';
+let artifact = null;
+try {
+  const { openConfigStore } = await import('/packages/dshub-provider/src/configStore.mjs');
+  artifact = await openConfigStore({}).get('artifacts', `${DS}@v1`);
+} catch { /* no store, fall through */ }
+artifact ??= await (await fetch('/packages/dshub-spec/corpus/positions/artifact.json')).json();
+artifact.estimatedRows = 20000;
+
+// ---- the grid, built entirely from the artifact -----------------------------
+let mode;
+const dataService = new CsrmDataService({
+  getRows: () => (mode ? [...mode.rows.values()] : []),
+  artifact, keyColumns: ['positionId'], softDeleteColumn: '_deleted',
+  searchColumns: ['desk', 'trader', 'bookName', 'instrumentType'],
+});
+
+/**
+ * Lead with identity, then the columns the feed actually moves.
+ *
+ * Taking the first 40 of 372 in artifact order put `accruedInterest` and forty
+ * `additionalAttributes_*` on screen — all of them static. The grid was
+ * applying ~10k updates every five seconds and not one visible cell changed,
+ * which reads exactly like a broken live path.
+ */
+const TICKING = ['pnl', 'dailyPnl', 'mtdPnl', 'ytdPnl', 'unrealizedPnl', 'marketValue',
+                 'totalValue', 'currentPrice', 'dv01', 'pv01', 'cs01', 'yield', 'zSpread'];
+const IDENTITY = ['positionId', 'desk', 'trader', 'bookName', 'instrumentType', 'cusip', 'ticker'];
+
+const allDefs = buildColDefs(artifact, dataService);
+const byId = new Map(allDefs.map((d) => [d.colId ?? d.field, d]));
+const lead = [...IDENTITY, ...TICKING].map((id) => byId.get(id)).filter(Boolean);
+const leadIds = new Set(lead.map((d) => d.colId ?? d.field));
+const colDefs = [...lead, ...allDefs.filter((d) => !leadIds.has(d.colId ?? d.field))].slice(0, 40);
+window.__blotter.colDefs = colDefs.length;
+$('mode').textContent = selectMode(artifact);
+
+/**
+ * Parameter-based theming (the Theming API), not a legacy `ag-theme-*` CSS
+ * class. From v33 themes are JS objects composed from parts and parameters, so
+ * the grid's look is configured in code alongside everything else rather than
+ * by loading a stylesheet and hoping the class name matches.
+ */
+const theme = themeQuartz
+  .withPart(colorSchemeDark)
+  .withPart(iconSetQuartzBold)
+  .withParams({
+    backgroundColor: '#14181d',
+    foregroundColor: '#e7eaed',
+    borderColor: '#2b3138',
+    headerBackgroundColor: '#1a1e23',
+    headerTextColor: '#8a939c',
+    oddRowBackgroundColor: '#171b21',
+    rowHoverColor: '#1e242b',
+    accentColor: '#e5a244',
+    fontFamily: 'ui-monospace, Menlo, monospace',
+    fontSize: 12,
+    headerFontSize: 11,
+    rowHeight: 26,
+    headerHeight: 30,
+    cellHorizontalPadding: 8,
+  });
+
+const gridApi = createGrid($('grid'), {
+  theme,
+  columnDefs: colDefs,
+  rowData: [],
+  getRowId: (p) => mode.getRowId(p),
+  defaultColDef: { sortable: true, resizable: true, filter: true },
+  // Async transactions batch across frames; without this a 13k/sec update
+  // stream blocks the main thread.
+  asyncTransactionWaitMillis: 60,
+  suppressColumnVirtualisation: false,
+});
+
+// ---- worker connection ------------------------------------------------------
+const v = new URLSearchParams(location.search).get('v') ?? 'blotter1';
+const worker = new SharedWorker(`/apps/dshub-spike/web/dshub.worker.mjs?v=${v}`, { type: 'module', name: `dshub-${v}` });
+
+const control = new ControlClient({ send: (m) => transport.send(m), timeoutMs: 60_000 });
+const transport = new Transport({
+  connect: () => worker.port,
+  onControl: (m) => {
+    if (m.type === 'result' && m.payload?.ready) { boot(); return; }
+    control.handle(m);
+  },
+  onState: (s) => { if (s === 'disconnected') control.failAll(); },
+});
+transport.open();
+
+/**
+ * `subscribe` returning does NOT mean there is data.
+ *
+ * It means the hub has accepted the subscription and started connecting — the
+ * snapshot is still arriving. Reading at that moment scans an EMPTY table and
+ * the blotter comes up blank with no error, which is the worst kind of failure
+ * because everything looks healthy.
+ *
+ * The state machine is the signal: wait for `live`.
+ */
+let resolveLive;
+const liveOnce = new Promise((r) => { resolveLive = r; });
+
+// Full state events, with ids: a duplicate id means the transport delivered a
+// message twice, a distinct id means the hub published twice. Worth telling
+// apart, because one of those affects every control message and not just state.
+window.__blotter.stateEvents = [];
+control.on('state', (m) => { window.__blotter.stateEvents.push({ id: m.id, state: m.state, detail: m.detail }); });
+
+control.on('state', (m) => {
+  window.__blotter.states.push(m.state);
+  setState(m.state);
+  if (m.state === 'live') resolveLive?.();
+});
+
+// The ref identifies the subscription. Every later query MUST reuse it —
+// querying with different params cannot match the registry entry.
+/**
+ * Which datasource, from the query string.
+ *
+ * `?ds=positions-ws` and `?ds=positions-rest` point at the same corpus over a
+ * different transport. Nothing else on this page changes — that IS the Phase 6
+ * exit criterion, so it is worth being able to demonstrate rather than assert.
+ */
+const REF = { datasourceId: DS, params: { clientId: 'trd1', rate: 2000, batchSize: 10 } };
+window.__control = control;
+window.__ref = REF;
+
+window.__gridApi = gridApi;
+window.__artifact = artifact;
+
+async function boot() {
+  if (window.__blotter.ready) return;
+  window.__blotter.ready = true;
+  try {
+    await control.hello({ appId: 'blotter' });
+    const sub = await control.subscribe(REF);
+    $('mode').textContent = sub.mode;
+
+    // Wait for the snapshot to complete before the first read.
+    await Promise.race([
+      liveOnce,
+      new Promise((_, rej) => setTimeout(() => rej(new Error('no live state within 60s')), 60000)),
+    ]);
+
+    // The engine seam, pointed at the worker's table over the port. The hub
+    // owns the table; this side only reads and subscribes.
+    await startCsrm(sub.tableName);
+  } catch (e) {
+    $('err').textContent = String(e.message ?? e).slice(0, 120);
+    window.__blotter.errors.push(String(e.message ?? e));
+    setState('failed');
+  }
+}
+
+/**
+ * The worker owns the Perspective table, so this page pulls rows over the
+ * control channel with `scan`. A production blotter attaches a Perspective
+ * client to the same port and reads over the BINARY channel instead — that is
+ * what §7.1's two-channel split exists for, and it avoids this copy entirely.
+ */
+async function startCsrm() {
+  const engine = {
+    createView: async () => ({}),
+    readWindow: async () => {
+      // scan streams batches as `partial` results; the ControlClient routes
+      // them to onPartial and resolves only on the final reply.
+      const cols = {};
+      const diag = window.__blotter.scan = { partials: 0, rows: 0, cols: 0, final: null, error: null };
+      try {
+        const final = await control.request(
+          { type: 'scan', ref: REF, batchRows: 5000 },
+          {
+            timeoutMs: 120000,
+            onPartial: (payload) => {
+              const block = payload?.block;
+              diag.partials++;
+              if (!block) return;
+              const keys = Object.keys(block);
+              diag.cols = keys.length;
+              diag.rows += block[keys[0]]?.length ?? 0;
+              for (const [k, v] of Object.entries(block)) (cols[k] ??= []).push(...v);
+            },
+          }
+        );
+        diag.final = final?.payload ?? null;
+      } catch (e) { diag.error = String(e.message ?? e).slice(0, 200); throw e; }
+      diag.returnedCols = Object.keys(cols).length;
+      return cols;
+    },
+    /**
+     * Live deltas arrive as `rowDelta` events from the hub and go straight into
+     * CsrmMode.applyDelta, which routes them to applyTransactionAsync keyed by
+     * getRowId. This is the update path; without it the grid loads once and
+     * then sits still.
+     */
+    onUpdate: (_v, cb) => control.on('rowDelta', (m) => cb(m.columns)),
+    dispose: async () => {},
+  };
+  mode = new CsrmMode({
+    // Acknowledge what the GRID has applied, so the hub can tell this tab from
+    // a wedged one. Without it the hub sees an ever-growing backlog and
+    // eventually drops the subscription — correctly, since silence and
+    // slowness are indistinguishable over a MessagePort (architecture §7.4).
+    onApplied: (seq) => control.ack(seq, REF),
+    engine, gridApi, artifact, keyColumns: ['positionId'], softDeleteColumn: '_deleted',
+    onLatency: (n) => { latencies.push(n); if (latencies.length > 500) latencies.shift(); },
+  });
+  await mode.start({}, {});
+  setInterval(() => {
+    window.__blotter.rows = mode.rowCount();
+    window.__blotter.applied = mode.applied;
+    window.__blotter.removed = mode.removed;
+    $('rows').textContent = mode.rowCount().toLocaleString();
+    $('applied').textContent = mode.applied.toLocaleString();
+    $('removed').textContent = mode.removed.toLocaleString();
+    $('p50').textContent = p50();
+  }, 500);
+}
+</script>

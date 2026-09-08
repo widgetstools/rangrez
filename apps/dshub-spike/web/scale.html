@@ -1,0 +1,184 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Perspective at 500k × 160</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin:0; padding:18px; font:13px ui-monospace,Menlo,monospace; background:#14181d; color:#e7eaed; }
+  h1 { font-size:15px; margin:0 0 4px; }
+  p.sub { color:#8a939c; margin:0 0 18px; max-width:70ch; line-height:1.5; }
+  table { border-collapse:collapse; margin:14px 0; }
+  th,td { text-align:right; padding:4px 14px; border-bottom:1px solid #2b3138; }
+  th:first-child, td:first-child { text-align:left; }
+  th { color:#8a939c; font-weight:600; }
+  #log { white-space:pre-wrap; color:#8a939c; line-height:1.5; }
+  b { color:#e5a244; }
+</style>
+
+<h1>Perspective at 500k × 160</h1>
+<p class="sub">
+  The SSRM-vs-VRM mode rule rests on Phase 0 numbers taken at 20,000 rows — a
+  dataset 25× smaller than the one the rule is written for. This measures the
+  same things at the size that matters.
+</p>
+<div id="log">booting…</div>
+<div id="out"></div>
+
+<script type="module">
+import * as psp from '/node_modules/@perspective-dev/client/dist/esm/perspective.inline.js';
+
+const ROWS = Number(new URLSearchParams(location.search).get('rows') ?? 500_000);
+const COLS = Number(new URLSearchParams(location.search).get('cols') ?? 160);
+const log = (m) => { document.getElementById('log').textContent += '\n' + m; };
+const ms = (t) => `${t.toFixed(0)} ms`;
+const mb = (b) => `${(b / 1e6).toFixed(0)} MB`;
+
+/**
+ * A schema shaped like the real corpus: a few low-cardinality dimensions to
+ * group by, the rest numeric measures. Grouping cost depends on the number of
+ * GROUPS, so the dimensions have to be realistic or the measurement is
+ * meaningless.
+ */
+const DESKS = ['Govies', 'EM Debt', 'HY Credit', 'IG Credit', 'Inflation', 'Rates', 'Munis', 'Structured'];
+const TRADERS = Array.from({ length: 60 }, (_, i) => `Trader ${i}`);
+const CCY = ['USD', 'EUR', 'GBP', 'JPY', 'AUD', 'CAD', 'CHF'];
+
+function schema() {
+  const s = { positionId: 'string', desk: 'string', trader: 'string', currency: 'string', book: 'string' };
+  for (let i = 0; i < COLS - 5; i++) s[`m${i}`] = 'float';
+  return s;
+}
+
+/** Column-oriented chunk — what the engine actually wants. */
+function chunk(start, n) {
+  const c = {
+    positionId: new Array(n), desk: new Array(n), trader: new Array(n),
+    currency: new Array(n), book: new Array(n),
+  };
+  // Plain arrays, not Float64Array: Perspective rejects typed arrays in a
+  // column-oriented update with "Failed to construct table from JsValue".
+  for (let i = 0; i < COLS - 5; i++) c[`m${i}`] = new Array(n);
+  for (let r = 0; r < n; r++) {
+    const g = start + r;
+    c.positionId[r] = `POS-${g}`;
+    c.desk[r] = DESKS[g % DESKS.length];
+    c.trader[r] = TRADERS[g % TRADERS.length];
+    c.currency[r] = CCY[g % CCY.length];
+    c.book[r] = `BOOK${String(g % 400).padStart(3, '0')}`;
+    for (let i = 0; i < COLS - 5; i++) c[`m${i}`][r] = (g % 1000) + i + (g / 7 % 1);
+  }
+  return c;
+}
+
+const mem = async (client) => {
+  try { const h = await client.system_info(); return h.heap_size ?? h.used_size ?? 0; }
+  catch { return 0; }
+};
+
+const time = async (fn) => { const t = performance.now(); const v = await fn(); return [performance.now() - t, v]; };
+
+(async () => {
+  const client = await psp.worker();
+  log(`schema: ${COLS} columns, target ${ROWS.toLocaleString()} rows`);
+
+  const table = await client.table(schema(), { index: 'positionId' });
+  const before = await mem(client);
+
+  const CHUNK = 10_000;
+  const t0 = performance.now();
+  for (let i = 0; i < ROWS; i += CHUNK) {
+    await table.update(chunk(i, Math.min(CHUNK, ROWS - i)));
+    // YIELD. Generating 80M cells in a tight await loop starves the event loop
+    // so completely that the page cannot even be inspected — a measurement
+    // nobody can read is not a measurement.
+    await new Promise((r) => setTimeout(r, 0));
+    log(`loaded ${Math.min(i + CHUNK, ROWS).toLocaleString()} / ${ROWS.toLocaleString()}`);
+  }
+  const loadMs = performance.now() - t0;
+  const after = await mem(client);
+  const size = await table.size();
+
+  log(`\nloaded ${size.toLocaleString()} rows in ${ms(loadMs)} (${Math.round(size / (loadMs / 1000)).toLocaleString()} rows/sec)`);
+  log(`table memory ~${mb(after - before)} (${((after - before) / (size * COLS)).toFixed(1)} bytes/cell)`);
+
+  const rows = [];
+  const record = (label, t, extra = '') => { rows.push([label, ms(t), extra]); log(`${label}: ${ms(t)} ${extra}`); };
+
+  // 1. Flat filtered view — the SSRM case.
+  const [flatMs, flat] = await time(() => table.view({ filter: [['desk', '==', 'Govies']] }));
+  record('flat filtered view', flatMs, `${(await flat.num_rows()).toLocaleString()} rows`);
+
+  // 2. Grouped views at the depths SSRM actually opens.
+  const [g1Ms, g1] = await time(() => table.view({ group_by: ['desk'], aggregates: { m0: 'sum' } }));
+  record('grouped 1 level', g1Ms, `${(await g1.num_rows()).toLocaleString()} rows`);
+
+  const [g2Ms, g2] = await time(() => table.view({ group_by: ['desk', 'trader'], aggregates: { m0: 'sum' } }));
+  record('grouped 2 levels', g2Ms, `${(await g2.num_rows()).toLocaleString()} rows`);
+
+  const [g3Ms, g3] = await time(() => table.view({ group_by: ['desk', 'trader', 'book'], aggregates: { m0: 'sum' } }));
+  record('grouped 3 levels', g3Ms, `${(await g3.num_rows()).toLocaleString()} rows`);
+
+  // 3. The SSRM shape: many filtered views held open at once, one per expanded
+  //    node. This is the cost VRM exists to avoid.
+  const held = [];
+  const [openMs] = await time(async () => {
+    for (let i = 0; i < 50; i++) {
+      held.push(await table.view({
+        group_by: ['trader'], aggregates: { m0: 'sum' },
+        filter: [['desk', '==', DESKS[i % DESKS.length]], ['currency', '==', CCY[i % CCY.length]]],
+      }));
+    }
+  });
+  record('50 grouped views (SSRM shape)', openMs, `${ms(openMs / 50)} each`);
+  const withOpen = await mem(client);
+  log(`memory with 50 views open: +${mb(withOpen - after)}`);
+
+  /**
+   * 4. Ingest throughput with those views open vs none.
+   *
+   * REPEATED, and interleaved rather than run as two blocks. Phase 0 measured a
+   * 3.3x penalty at 20k rows and this contradicts it, so a single sample would
+   * not be enough to overturn a published number — and running all the "busy"
+   * samples before all the "idle" ones would let any warm-up drift land
+   * entirely on one side.
+   */
+  const busy = [], idle = [];
+  for (let pass = 0; pass < 3; pass++) {
+    const [b] = await time(() => table.update(chunk(pass * 25_000, 25_000)));
+    busy.push(b);
+    await new Promise((r) => setTimeout(r, 0));
+    for (const v of held.splice(0)) await v.delete();
+    const [i2] = await time(() => table.update(chunk(pass * 25_000, 25_000)));
+    idle.push(i2);
+    await new Promise((r) => setTimeout(r, 0));
+    if (pass < 2) {
+      for (let i = 0; i < 50; i++) {
+        held.push(await table.view({
+          group_by: ['trader'], aggregates: { m0: 'sum' },
+          filter: [['desk', '==', DESKS[i % DESKS.length]], ['currency', '==', CCY[i % CCY.length]]],
+        }));
+      }
+    }
+  }
+  const med = (a) => [...a].sort((x, y) => x - y)[Math.floor(a.length / 2)];
+  const busyMs = med(busy), idleMs = med(idle);
+  record('update 25k, 50 views open', busyMs, `${Math.round(25_000 / (busyMs / 1000)).toLocaleString()} rows/sec (n=3)`);
+  record('update 25k, no views open', idleMs, `${Math.round(25_000 / (idleMs / 1000)).toLocaleString()} rows/sec (n=3)`);
+  log(`\ningest penalty from holding 50 views: ${(busyMs / idleMs).toFixed(2)}x`);
+  log(`  busy samples: ${busy.map((x) => x.toFixed(0)).join(', ')} ms`);
+  log(`  idle samples: ${idle.map((x) => x.toFixed(0)).join(', ')} ms`);
+
+  // 5. VRM's shape: ONE grouped view, read a window.
+  const [winMs] = await time(() => g3.to_columns({ start_row: 0, end_row: 100 }));
+  record('read 100-row window from the tree', winMs);
+
+  for (const v of [flat, g1, g2, g3]) await v.delete();
+
+  document.getElementById('out').innerHTML =
+    '<table><tr><th>measurement</th><th>time</th><th></th></tr>' +
+    rows.map(([a, b, c]) => `<tr><td>${a}</td><td><b>${b}</b></td><td>${c}</td></tr>`).join('') +
+    '</table>';
+  window.__table = table;
+  window.__scale = { rows: size, cols: COLS, loadMs, bytesPerCell: (after - before) / (size * COLS), measurements: rows, busy, idle };
+  log('\ndone');
+})().catch((e) => log('FAILED: ' + (e.stack ?? e)));
+</script>

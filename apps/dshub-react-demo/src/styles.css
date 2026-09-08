@@ -1,0 +1,82 @@
+:root {
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font: 13px ui-monospace, Menlo, monospace;
+  background: #0e1216;
+  color: #e7eaed;
+}
+
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+header {
+  display: flex;
+  gap: 16px;
+  align-items: center;
+  flex-wrap: wrap;
+  padding: 10px 16px;
+  background: #14181d;
+  border-bottom: 1px solid #2b3138;
+}
+
+header h1 {
+  font-size: 14px;
+  font-weight: 600;
+  margin: 0;
+}
+
+.modes {
+  display: flex;
+  gap: 4px;
+}
+
+.modes button {
+  font: inherit;
+  font-size: 11px;
+  padding: 3px 12px;
+  border-radius: 10px;
+  border: 1px solid #2b3138;
+  background: #1b2027;
+  color: #8a939c;
+  cursor: pointer;
+}
+
+.modes button.on {
+  background: #1b2b1e;
+  border-color: #2f5133;
+  color: #8fd39b;
+}
+
+.sub {
+  color: #8a939c;
+  font-size: 11px;
+}
+
+.grid {
+  flex: 1;
+  min-height: 0;
+}
+
+.boot {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #8a939c;
+}

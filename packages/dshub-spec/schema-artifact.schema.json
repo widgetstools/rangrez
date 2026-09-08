@@ -1,0 +1,133 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wellsfargo-starui/dshub/schema-artifact.schema.json",
+  "title": "Schema artifact",
+  "description": "The single source for the Perspective schema, key columns, colDefs and filter strategy for one datasource. Produced by an offline inference pass, reviewed by a human, versioned (architecture §4). Never auto-applied in production.",
+  "specVersion": "1.0",
+
+  "type": "object",
+  "required": ["id", "version", "keyColumns", "columns"],
+  "additionalProperties": false,
+  "properties": {
+    "id":      { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
+    "version": { "type": "integer", "minimum": 1 },
+
+    "inferredAt":   { "type": "string", "format": "date-time" },
+    "inferredFrom": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Provenance. An artifact whose sample was too small to trust is a support ticket waiting to happen.",
+      "properties": {
+        "messageCount":  { "type": "integer", "minimum": 1 },
+        "destination":   { "type": "string" },
+        "minNonNullPerLeaf": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "reviewedBy": {
+      "type": "string",
+      "description": "Inference output is reviewable, never auto-applied (architecture §4.1). An unreviewed artifact should not reach production."
+    },
+
+    "keyColumns": { "type": "array", "minItems": 1, "items": { "type": "string" } },
+    "columns":    { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/column" } },
+
+    "volatileSortColumns": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Columns whose value churns and that users also sort on. Drives the SSRM sort-position-drift policy (parity study §5.3); default is to accept drift rather than refresh."
+    },
+    "setFilterColumns": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Only these pay the unseen-value check on the update path — not all 160 (parity study §1.3)."
+    },
+    "estimatedRows": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Drives automatic mode selection (architecture §8.3) and admission accounting against the process ceiling (§6.2)."
+    }
+  },
+
+  "$defs": {
+
+    "perspectiveType": {
+      "enum": ["string", "integer", "float", "boolean", "datetime", "date"],
+      "description": "Widen int->float on conflict, never narrow. Numeric-looking strings stay strings — CUSIP, SEDOL, ISIN and account numbers lose leading zeros or precision otherwise (architecture §4.1)."
+    },
+
+    "filterStrategy": {
+      "enum": ["set", "search-select", "text", "number", "date", "none"],
+      "description": "Chosen from observed cardinality: <500 set eager · 500-10k set lazy · >10k search-select. AG-Grid ships the whole set-filter value list to the browser, so beyond ~10k the UX degrades regardless of virtualization (parity study §1.4)."
+    },
+
+    "column": {
+      "type": "object",
+      "required": ["id", "path", "column", "type"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Stable identifier. DSL rules reference this, not the display name, so renames do not break persisted rules (architecture §9.3)."
+        },
+        "path":   { "type": "string", "description": "Source path in the raw payload, before flattening." },
+        "column": { "type": "string", "description": "Flattened Perspective column name." },
+        "type":   { "$ref": "#/$defs/perspectiveType" },
+
+        "nullable":    { "type": "boolean" },
+        "cardinality": { "type": "integer", "minimum": 0 },
+        "filter":      { "$ref": "#/$defs/filterStrategy" },
+
+        "cascadingValues": {
+          "type": "boolean",
+          "description": "Opt-in per column. Every filter change invalidates N distinct-value caches, so enable only where traders expect it (parity study §1.5)."
+        },
+
+        "observed": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Inference evidence. Kept so a reviewer can judge the call rather than trust it.",
+          "properties": {
+            "nonNullCount":  { "type": "integer", "minimum": 0 },
+            "nullCount":     { "type": "integer", "minimum": 0 },
+            "min":           {},
+            "max":           {},
+            "maxStringLength": { "type": "integer", "minimum": 0 },
+            "maxDecimals":   { "type": "integer", "minimum": 0 },
+            "samples":       { "type": "array", "maxItems": 10 }
+          }
+        },
+
+        "companion": {
+          "type": "object",
+          "required": ["column", "type", "coercion"],
+          "additionalProperties": false,
+          "description": "Numeric twin for a display-formatted column. 32nds prices sort and aggregate through this (architecture §4.2).",
+          "properties": {
+            "column":   { "type": "string" },
+            "type":     { "$ref": "#/$defs/perspectiveType" },
+            "coercion": { "enum": ["ticks-to-decimal", "string-to-number", "epoch-to-datetime", "scaled-integer"] }
+          }
+        },
+
+        "colDef": {
+          "type": "object",
+          "description": "Fragment merged into the generated AG-Grid ColDef. Deliberately open — AG-Grid 36 ColDef is large and pinning its shape here would duplicate their types.",
+          "properties": {
+            "headerName":     { "type": "string" },
+            "width":          { "type": "integer", "minimum": 1 },
+            "type":           { "type": "string" },
+            "enableRowGroup": { "type": "boolean" },
+            "enableValue":    { "type": "boolean" },
+            "sortColumn": {
+              "type": "string",
+              "description": "Points at the companion column where one exists. Custom comparators are never called in SSRM (parity study §3), so sort ordering must live in the data."
+            },
+            "aggFunc":   { "type": "string" },
+            "precision": { "type": "integer", "minimum": 0 },
+            "hide":      { "type": "boolean" }
+          }
+        }
+      }
+    }
+  }
+}

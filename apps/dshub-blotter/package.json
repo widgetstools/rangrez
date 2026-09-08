@@ -1,0 +1,25 @@
+{
+  "name": "@wellsfargo-starui/dshub-blotter",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "echo no-typescript-yet",
+    "dev": "echo no-dev-yet",
+    "lint": "echo no-lint-yet",
+    "test": "echo no-tests-yet",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "ag-grid-community": "36.0.0",
+    "ag-grid-enterprise": "36.0.0",
+    "ag-grid-react": "36.0.0",
+    "@wellsfargo-starui/dshub-provider": "*"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0"
+  }
+}

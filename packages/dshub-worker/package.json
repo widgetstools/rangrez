@@ -1,0 +1,13 @@
+{
+  "name": "@wellsfargo-starui/dshub-worker",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "build": "echo no-typescript-yet",
+    "lint": "echo no-lint-yet",
+    "test": "node --test 'test/*.test.mjs'",
+    "clean": "rm -rf dist"
+  }
+}

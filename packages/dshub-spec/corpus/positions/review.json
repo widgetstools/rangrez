@@ -1,0 +1,470 @@
+[
+  {
+    "path": "positionId",
+    "reason": "20000 distinct in 20000 observations — near-unique, so the sample cannot bound the real cardinality. Treated as unbounded (search-select). Re-sample larger to confirm."
+  },
+  {
+    "path": "cusip",
+    "reason": "20000 distinct in 20000 observations — near-unique, so the sample cannot bound the real cardinality. Treated as unbounded (search-select). Re-sample larger to confirm."
+  },
+  {
+    "path": "isin",
+    "reason": "20000 distinct in 20000 observations — near-unique, so the sample cannot bound the real cardinality. Treated as unbounded (search-select). Re-sample larger to confirm."
+  },
+  {
+    "path": "sedol",
+    "reason": "20000 distinct in 20000 observations — near-unique, so the sample cannot bound the real cardinality. Treated as unbounded (search-select). Re-sample larger to confirm."
+  },
+  {
+    "path": "instrumentName",
+    "reason": "20000 distinct in 20000 observations — near-unique, so the sample cannot bound the real cardinality. Treated as unbounded (search-select). Re-sample larger to confirm."
+  },
+  {
+    "path": "asOfDate",
+    "reason": "100.0% ISO-8601 — confirm before applying, and check timezone handling"
+  },
+  {
+    "path": "portfolio",
+    "reason": "20000 distinct in 20000 observations — near-unique, so the sample cannot bound the real cardinality. Treated as unbounded (search-select). Re-sample larger to confirm."
+  },
+  {
+    "path": "quantity",
+    "reason": "every observed value was a whole number — confirm this is not a float that happened to sample whole"
+  },
+  {
+    "path": "notionalAmount",
+    "reason": "every observed value was a whole number — confirm this is not a float that happened to sample whole"
+  },
+  {
+    "path": "marketValue",
+    "reason": "every observed value was a whole number — confirm this is not a float that happened to sample whole"
+  },
+  {
+    "path": "totalValue",
+    "reason": "every observed value was a whole number — confirm this is not a float that happened to sample whole"
+  },
+  {
+    "path": "pnl",
+    "reason": "every observed value was a whole number — confirm this is not a float that happened to sample whole"
+  },
+  {
+    "path": "unrealizedPnl",
+    "reason": "every observed value was a whole number — confirm this is not a float that happened to sample whole"
+  },
+  {
+    "path": "realizedPnl",
+    "reason": "every observed value was a whole number — confirm this is not a float that happened to sample whole"
+  },
+  {
+    "path": "dailyPnl",
+    "reason": "every observed value was a whole number — confirm this is not a float that happened to sample whole"
+  },
+  {
+    "path": "mtdPnl",
+    "reason": "every observed value was a whole number — confirm this is not a float that happened to sample whole"
+  },
+  {
+    "path": "ytdPnl",
+    "reason": "every observed value was a whole number — confirm this is not a float that happened to sample whole"
+  },
+  {
+    "path": "maturityDate",
+    "reason": "100.0% ISO-8601 — confirm before applying, and check timezone handling"
+  },
+  {
+    "path": "issueDate",
+    "reason": "100.0% ISO-8601 — confirm before applying, and check timezone handling"
+  },
+  {
+    "path": "couponFrequency",
+    "reason": "every observed value was a whole number — confirm this is not a float that happened to sample whole"
+  },
+  {
+    "path": "nextCouponDate",
+    "reason": "100.0% ISO-8601 — confirm before applying, and check timezone handling"
+  },
+  {
+    "path": "spread",
+    "reason": "every observed value was a whole number — confirm this is not a float that happened to sample whole"
+  },
+  {
+    "path": "assetSwapSpread",
+    "reason": "every observed value was a whole number — confirm this is not a float that happened to sample whole"
+  },
+  {
+    "path": "zSpread",
+    "reason": "every observed value was a whole number — confirm this is not a float that happened to sample whole"
+  },
+  {
+    "path": "oas",
+    "reason": "every observed value was a whole number — confirm this is not a float that happened to sample whole"
+  },
+  {
+    "path": "issuer.name",
+    "reason": "20000 distinct in 20000 observations — near-unique, so the sample cannot bound the real cardinality. Treated as unbounded (search-select). Re-sample larger to confirm."
+  },
+  {
+    "path": "issuer.parentCompany",
+    "reason": "20000 distinct in 20000 observations — near-unique, so the sample cannot bound the real cardinality. Treated as unbounded (search-select). Re-sample larger to confirm."
+  },
+  {
+    "path": "issuer.marketCap",
+    "reason": "every observed value was a whole number — confirm this is not a float that happened to sample whole"
+  },
+  {
+    "path": "marketData.lastTradeTime",
+    "reason": "100.0% ISO-8601 — confirm before applying, and check timezone handling"
+  },
+  {
+    "path": "marketData.volume",
+    "reason": "every observed value was a whole number — confirm this is not a float that happened to sample whole"
+  },
+  {
+    "path": "liquidity.marketDepth",
+    "reason": "every observed value was a whole number — confirm this is not a float that happened to sample whole"
+  },
+  {
+    "path": "compliance.regulatoryCapital",
+    "reason": "every observed value was a whole number — confirm this is not a float that happened to sample whole"
+  },
+  {
+    "path": "compliance.rwa",
+    "reason": "every observed value was a whole number — confirm this is not a float that happened to sample whole"
+  },
+  {
+    "path": "metadata.createdDate",
+    "reason": "100.0% ISO-8601 — confirm before applying, and check timezone handling"
+  },
+  {
+    "path": "metadata.modifiedDate",
+    "reason": "100.0% ISO-8601 — confirm before applying, and check timezone handling"
+  },
+  {
+    "path": "metadata.version",
+    "reason": "every observed value was a whole number — confirm this is not a float that happened to sample whole"
+  },
+  {
+    "path": "regulatoryTags.tag_0",
+    "reason": "mixed string and number observed — kept as string"
+  },
+  {
+    "path": "regulatoryTags.tag_1",
+    "reason": "mixed string and number observed — kept as string"
+  },
+  {
+    "path": "regulatoryTags.tag_2",
+    "reason": "mixed string and number observed — kept as string"
+  },
+  {
+    "path": "regulatoryTags.tag_3",
+    "reason": "mixed string and number observed — kept as string"
+  },
+  {
+    "path": "regulatoryTags.tag_4",
+    "reason": "mixed string and number observed — kept as string"
+  },
+  {
+    "path": "regulatoryTags.tag_5",
+    "reason": "mixed string and number observed — kept as string"
+  },
+  {
+    "path": "regulatoryTags.tag_6",
+    "reason": "mixed string and number observed — kept as string"
+  },
+  {
+    "path": "regulatoryTags.tag_7",
+    "reason": "mixed string and number observed — kept as string"
+  },
+  {
+    "path": "regulatoryTags.tag_8",
+    "reason": "mixed string and number observed — kept as string"
+  },
+  {
+    "path": "regulatoryTags.tag_9",
+    "reason": "mixed string and number observed — kept as string"
+  },
+  {
+    "path": "regulatoryTags.tag_10",
+    "reason": "mixed string and number observed — kept as string"
+  },
+  {
+    "path": "regulatoryTags.tag_11",
+    "reason": "mixed string and number observed — kept as string"
+  },
+  {
+    "path": "regulatoryTags.tag_12",
+    "reason": "mixed string and number observed — kept as string"
+  },
+  {
+    "path": "regulatoryTags.tag_13",
+    "reason": "mixed string and number observed — kept as string"
+  },
+  {
+    "path": "regulatoryTags.tag_14",
+    "reason": "mixed string and number observed — kept as string"
+  },
+  {
+    "path": "regulatoryTags.tag_15",
+    "reason": "mixed string and number observed — kept as string"
+  },
+  {
+    "path": "regulatoryTags.tag_16",
+    "reason": "mixed string and number observed — kept as string"
+  },
+  {
+    "path": "regulatoryTags.tag_17",
+    "reason": "mixed string and number observed — kept as string"
+  },
+  {
+    "path": "regulatoryTags.tag_18",
+    "reason": "mixed string and number observed — kept as string"
+  },
+  {
+    "path": "regulatoryTags.tag_19",
+    "reason": "mixed string and number observed — kept as string"
+  },
+  {
+    "path": "regulatoryTags.tag_20",
+    "reason": "mixed string and number observed — kept as string"
+  },
+  {
+    "path": "regulatoryTags.tag_21",
+    "reason": "mixed string and number observed — kept as string"
+  },
+  {
+    "path": "regulatoryTags.tag_22",
+    "reason": "mixed string and number observed — kept as string"
+  },
+  {
+    "path": "regulatoryTags.tag_23",
+    "reason": "mixed string and number observed — kept as string"
+  },
+  {
+    "path": "regulatoryTags.tag_24",
+    "reason": "mixed string and number observed — kept as string"
+  },
+  {
+    "path": "regulatoryTags.tag_25",
+    "reason": "mixed string and number observed — kept as string"
+  },
+  {
+    "path": "regulatoryTags.tag_26",
+    "reason": "mixed string and number observed — kept as string"
+  },
+  {
+    "path": "regulatoryTags.tag_27",
+    "reason": "mixed string and number observed — kept as string"
+  },
+  {
+    "path": "regulatoryTags.tag_28",
+    "reason": "mixed string and number observed — kept as string"
+  },
+  {
+    "path": "regulatoryTags.tag_29",
+    "reason": "mixed string and number observed — kept as string"
+  },
+  {
+    "path": "regulatoryTags.tag_30",
+    "reason": "mixed string and number observed — kept as string"
+  },
+  {
+    "path": "regulatoryTags.tag_31",
+    "reason": "mixed string and number observed — kept as string"
+  },
+  {
+    "path": "regulatoryTags.tag_32",
+    "reason": "mixed string and number observed — kept as string"
+  },
+  {
+    "path": "regulatoryTags.tag_33",
+    "reason": "mixed string and number observed — kept as string"
+  },
+  {
+    "path": "regulatoryTags.tag_34",
+    "reason": "mixed string and number observed — kept as string"
+  },
+  {
+    "path": "regulatoryTags.tag_35",
+    "reason": "mixed string and number observed — kept as string"
+  },
+  {
+    "path": "regulatoryTags.tag_36",
+    "reason": "mixed string and number observed — kept as string"
+  },
+  {
+    "path": "regulatoryTags.tag_37",
+    "reason": "mixed string and number observed — kept as string"
+  },
+  {
+    "path": "regulatoryTags.tag_38",
+    "reason": "mixed string and number observed — kept as string"
+  },
+  {
+    "path": "regulatoryTags.tag_39",
+    "reason": "mixed string and number observed — kept as string"
+  },
+  {
+    "path": "additionalAttributes.attribute2",
+    "reason": "20000 distinct in 20000 observations — near-unique, so the sample cannot bound the real cardinality. Treated as unbounded (search-select). Re-sample larger to confirm."
+  },
+  {
+    "path": "additionalAttributes.attribute5",
+    "reason": "20000 distinct in 20000 observations — near-unique, so the sample cannot bound the real cardinality. Treated as unbounded (search-select). Re-sample larger to confirm."
+  },
+  {
+    "path": "additionalAttributes.attribute8",
+    "reason": "20000 distinct in 20000 observations — near-unique, so the sample cannot bound the real cardinality. Treated as unbounded (search-select). Re-sample larger to confirm."
+  },
+  {
+    "path": "additionalAttributes.attribute11",
+    "reason": "20000 distinct in 20000 observations — near-unique, so the sample cannot bound the real cardinality. Treated as unbounded (search-select). Re-sample larger to confirm."
+  },
+  {
+    "path": "additionalAttributes.attribute14",
+    "reason": "20000 distinct in 20000 observations — near-unique, so the sample cannot bound the real cardinality. Treated as unbounded (search-select). Re-sample larger to confirm."
+  },
+  {
+    "path": "additionalAttributes.attribute17",
+    "reason": "20000 distinct in 20000 observations — near-unique, so the sample cannot bound the real cardinality. Treated as unbounded (search-select). Re-sample larger to confirm."
+  },
+  {
+    "path": "additionalAttributes.attribute20",
+    "reason": "20000 distinct in 20000 observations — near-unique, so the sample cannot bound the real cardinality. Treated as unbounded (search-select). Re-sample larger to confirm."
+  },
+  {
+    "path": "additionalAttributes.attribute23",
+    "reason": "20000 distinct in 20000 observations — near-unique, so the sample cannot bound the real cardinality. Treated as unbounded (search-select). Re-sample larger to confirm."
+  },
+  {
+    "path": "additionalAttributes.attribute26",
+    "reason": "20000 distinct in 20000 observations — near-unique, so the sample cannot bound the real cardinality. Treated as unbounded (search-select). Re-sample larger to confirm."
+  },
+  {
+    "path": "additionalAttributes.attribute29",
+    "reason": "20000 distinct in 20000 observations — near-unique, so the sample cannot bound the real cardinality. Treated as unbounded (search-select). Re-sample larger to confirm."
+  },
+  {
+    "path": "additionalAttributes.attribute32",
+    "reason": "20000 distinct in 20000 observations — near-unique, so the sample cannot bound the real cardinality. Treated as unbounded (search-select). Re-sample larger to confirm."
+  },
+  {
+    "path": "additionalAttributes.attribute35",
+    "reason": "20000 distinct in 20000 observations — near-unique, so the sample cannot bound the real cardinality. Treated as unbounded (search-select). Re-sample larger to confirm."
+  },
+  {
+    "path": "additionalAttributes.attribute38",
+    "reason": "20000 distinct in 20000 observations — near-unique, so the sample cannot bound the real cardinality. Treated as unbounded (search-select). Re-sample larger to confirm."
+  },
+  {
+    "path": "additionalAttributes.attribute41",
+    "reason": "20000 distinct in 20000 observations — near-unique, so the sample cannot bound the real cardinality. Treated as unbounded (search-select). Re-sample larger to confirm."
+  },
+  {
+    "path": "additionalAttributes.attribute44",
+    "reason": "20000 distinct in 20000 observations — near-unique, so the sample cannot bound the real cardinality. Treated as unbounded (search-select). Re-sample larger to confirm."
+  },
+  {
+    "path": "additionalAttributes.attribute47",
+    "reason": "20000 distinct in 20000 observations — near-unique, so the sample cannot bound the real cardinality. Treated as unbounded (search-select). Re-sample larger to confirm."
+  },
+  {
+    "path": "additionalAttributes.attribute50",
+    "reason": "20000 distinct in 20000 observations — near-unique, so the sample cannot bound the real cardinality. Treated as unbounded (search-select). Re-sample larger to confirm."
+  },
+  {
+    "path": "additionalAttributes.attribute53",
+    "reason": "20000 distinct in 20000 observations — near-unique, so the sample cannot bound the real cardinality. Treated as unbounded (search-select). Re-sample larger to confirm."
+  },
+  {
+    "path": "additionalAttributes.attribute56",
+    "reason": "20000 distinct in 20000 observations — near-unique, so the sample cannot bound the real cardinality. Treated as unbounded (search-select). Re-sample larger to confirm."
+  },
+  {
+    "path": "additionalAttributes.attribute59",
+    "reason": "20000 distinct in 20000 observations — near-unique, so the sample cannot bound the real cardinality. Treated as unbounded (search-select). Re-sample larger to confirm."
+  },
+  {
+    "path": "additionalAttributes.attribute62",
+    "reason": "20000 distinct in 20000 observations — near-unique, so the sample cannot bound the real cardinality. Treated as unbounded (search-select). Re-sample larger to confirm."
+  },
+  {
+    "path": "additionalAttributes.attribute65",
+    "reason": "20000 distinct in 20000 observations — near-unique, so the sample cannot bound the real cardinality. Treated as unbounded (search-select). Re-sample larger to confirm."
+  },
+  {
+    "path": "additionalAttributes.attribute68",
+    "reason": "20000 distinct in 20000 observations — near-unique, so the sample cannot bound the real cardinality. Treated as unbounded (search-select). Re-sample larger to confirm."
+  },
+  {
+    "path": "additionalAttributes.attribute71",
+    "reason": "20000 distinct in 20000 observations — near-unique, so the sample cannot bound the real cardinality. Treated as unbounded (search-select). Re-sample larger to confirm."
+  },
+  {
+    "path": "additionalAttributes.attribute74",
+    "reason": "20000 distinct in 20000 observations — near-unique, so the sample cannot bound the real cardinality. Treated as unbounded (search-select). Re-sample larger to confirm."
+  },
+  {
+    "path": "additionalAttributes.attribute77",
+    "reason": "20000 distinct in 20000 observations — near-unique, so the sample cannot bound the real cardinality. Treated as unbounded (search-select). Re-sample larger to confirm."
+  },
+  {
+    "path": "additionalAttributes.attribute80",
+    "reason": "20000 distinct in 20000 observations — near-unique, so the sample cannot bound the real cardinality. Treated as unbounded (search-select). Re-sample larger to confirm."
+  },
+  {
+    "path": "additionalAttributes.attribute83",
+    "reason": "20000 distinct in 20000 observations — near-unique, so the sample cannot bound the real cardinality. Treated as unbounded (search-select). Re-sample larger to confirm."
+  },
+  {
+    "path": "additionalAttributes.attribute86",
+    "reason": "20000 distinct in 20000 observations — near-unique, so the sample cannot bound the real cardinality. Treated as unbounded (search-select). Re-sample larger to confirm."
+  },
+  {
+    "path": "additionalAttributes.attribute89",
+    "reason": "20000 distinct in 20000 observations — near-unique, so the sample cannot bound the real cardinality. Treated as unbounded (search-select). Re-sample larger to confirm."
+  },
+  {
+    "path": "additionalAttributes.attribute92",
+    "reason": "20000 distinct in 20000 observations — near-unique, so the sample cannot bound the real cardinality. Treated as unbounded (search-select). Re-sample larger to confirm."
+  },
+  {
+    "path": "additionalAttributes.attribute95",
+    "reason": "20000 distinct in 20000 observations — near-unique, so the sample cannot bound the real cardinality. Treated as unbounded (search-select). Re-sample larger to confirm."
+  },
+  {
+    "path": "additionalAttributes.attribute98",
+    "reason": "20000 distinct in 20000 observations — near-unique, so the sample cannot bound the real cardinality. Treated as unbounded (search-select). Re-sample larger to confirm."
+  },
+  {
+    "path": "additionalAttributes.attribute101",
+    "reason": "20000 distinct in 20000 observations — near-unique, so the sample cannot bound the real cardinality. Treated as unbounded (search-select). Re-sample larger to confirm."
+  },
+  {
+    "path": "additionalAttributes.attribute104",
+    "reason": "20000 distinct in 20000 observations — near-unique, so the sample cannot bound the real cardinality. Treated as unbounded (search-select). Re-sample larger to confirm."
+  },
+  {
+    "path": "additionalAttributes.attribute107",
+    "reason": "20000 distinct in 20000 observations — near-unique, so the sample cannot bound the real cardinality. Treated as unbounded (search-select). Re-sample larger to confirm."
+  },
+  {
+    "path": "additionalAttributes.attribute110",
+    "reason": "20000 distinct in 20000 observations — near-unique, so the sample cannot bound the real cardinality. Treated as unbounded (search-select). Re-sample larger to confirm."
+  },
+  {
+    "path": "additionalAttributes.attribute113",
+    "reason": "20000 distinct in 20000 observations — near-unique, so the sample cannot bound the real cardinality. Treated as unbounded (search-select). Re-sample larger to confirm."
+  },
+  {
+    "path": "additionalAttributes.attribute116",
+    "reason": "20000 distinct in 20000 observations — near-unique, so the sample cannot bound the real cardinality. Treated as unbounded (search-select). Re-sample larger to confirm."
+  },
+  {
+    "path": "additionalAttributes.attribute119",
+    "reason": "20000 distinct in 20000 observations — near-unique, so the sample cannot bound the real cardinality. Treated as unbounded (search-select). Re-sample larger to confirm."
+  },
+  {
+    "path": "clo.warf",
+    "reason": "every observed value was a whole number — confirm this is not a float that happened to sample whole"
+  }
+]

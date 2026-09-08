@@ -1,0 +1,70 @@
+{
+  "specVersion": "1.0",
+  "connections": [
+    {
+      "id": "viewserver-uat",
+      "kind": "stomp",
+      "url": "wss://vs-uat.corp/stomp",
+      "vhost": "/",
+      "heartbeat": { "outMs": 10000, "inMs": 10000 },
+      "auth": { "mode": "token-from-app" },
+      "credentialRef": "vault://desk/viewserver",
+      "reconnect": { "initialMs": 500, "maxMs": 30000, "factor": 2, "maxAttempts": null },
+      "failover": ["wss://vs-uat-b.corp/stomp"],
+      "tls": { "verify": true, "caRef": "system" }
+    }
+  ],
+  "datasources": [
+    {
+      "id": "cmbs-positions",
+      "connectionRef": "viewserver-uat",
+      "schemaRef": "cmbs-positions@v7",
+
+      "snapshot": {
+        "mode": "trigger-reply",
+        "triggerDestination": "/queue/snapshot.request",
+        "triggerBody": { "view": "positions.cmbs", "book": "{book}" },
+        "replyDestination": "/temp-queue/snapshot.reply",
+        "correlationHeader": "correlation-id",
+        "endOfSnapshot": { "kind": "sentinel-header", "header": "msg-type", "value": "EOS" },
+        "expectedCountHeader": "total-rows",
+        "timeoutMs": 120000,
+        "quietPeriodMs": null
+      },
+
+      "updates": {
+        "destination": "/topic/positions.cmbs.{book}",
+        "selector": null,
+        "subscribeBeforeSnapshot": true,
+        "updatesDuringSnapshot": "buffer"
+      },
+
+      "keyColumns": ["positionId"],
+      "opField": { "path": "action", "map": { "N": "insert", "U": "update", "D": "delete" } },
+      "softDelete": { "column": "_deleted", "reapAfterMs": 60000 },
+
+      "flatten": {
+        "separator": "_",
+        "maxDepth": 4,
+        "arrays": {
+          "legs": { "strategy": "explode", "childTable": "cmbs-position-legs" }
+        }
+      },
+
+      "coercions": [
+        { "path": "price", "kind": "ticks-to-decimal", "companion": "price32_num" }
+      ],
+
+      "batch": { "maxMs": 50, "maxRows": 5000, "dedupeByKey": true },
+      "conflation": { "defaultIntervalMs": 100, "maxIntervalMs": 1000 },
+
+      "params": {
+        "book": { "type": "string", "required": true }
+      },
+
+      "sharing": { "strategy": "superset", "supersetParams": { "book": "*" } },
+
+      "lifecycle": { "prewarm": false, "idleTeardownMs": 300000, "maxRows": 800000 }
+    }
+  ]
+}
