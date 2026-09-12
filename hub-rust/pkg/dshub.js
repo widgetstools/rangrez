@@ -270,6 +270,126 @@ export class RustHub {
         }
     }
     /**
+     * Delete rows by key (a JSON array of key strings). Deletions ride the
+     * delta stream like any other change, so subscribed grids receive them as
+     * `removals`. Returns `"[deleted]"`.
+     * @param {string} ds_id
+     * @param {string} params_json
+     * @param {string} keys_json
+     * @returns {string}
+     */
+    delete_rows(ds_id, params_json, keys_json) {
+        let deferred4_0;
+        let deferred4_1;
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passStringToWasm0(ds_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            const len0 = WASM_VECTOR_LEN;
+            const ptr1 = passStringToWasm0(params_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            const len1 = WASM_VECTOR_LEN;
+            const ptr2 = passStringToWasm0(keys_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            const len2 = WASM_VECTOR_LEN;
+            wasm.rusthub_delete_rows(retptr, this.__wbg_ptr, ptr0, len0, ptr1, len1, ptr2, len2);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            deferred4_0 = r0;
+            deferred4_1 = r1;
+            return getStringFromWasm0(r0, r1);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_free(deferred4_0, deferred4_1, 1);
+        }
+    }
+    /**
+     * Remove every row, keeping the schema and the table itself (and its
+     * subscriptions). One revision; the delta stream sees the truncation as
+     * removals. Returns `"[removed]"`.
+     * @param {string} ds_id
+     * @param {string} params_json
+     * @returns {string}
+     */
+    truncate(ds_id, params_json) {
+        let deferred3_0;
+        let deferred3_1;
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passStringToWasm0(ds_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            const len0 = WASM_VECTOR_LEN;
+            const ptr1 = passStringToWasm0(params_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            const len1 = WASM_VECTOR_LEN;
+            wasm.rusthub_truncate(retptr, this.__wbg_ptr, ptr0, len0, ptr1, len1);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            deferred3_0 = r0;
+            deferred3_1 = r1;
+            return getStringFromWasm0(r0, r1);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_free(deferred3_0, deferred3_1, 1);
+        }
+    }
+    /**
+     * Atomic truncate + ingest, in ONE revision — restart semantics: after it
+     * the table holds exactly the rows sent, so a snapshot that SHRANK no
+     * longer leaves stale keys rendering as current. Keys that survive the
+     * replace are never emitted as removals (`changed_since` drops a deletion
+     * superseded by a live re-upsert). Returns `"[upserts,truncated]"`.
+     * @param {string} ds_id
+     * @param {string} params_json
+     * @param {string} raw_json
+     * @returns {string}
+     */
+    replace_snapshot(ds_id, params_json, raw_json) {
+        let deferred4_0;
+        let deferred4_1;
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passStringToWasm0(ds_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            const len0 = WASM_VECTOR_LEN;
+            const ptr1 = passStringToWasm0(params_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            const len1 = WASM_VECTOR_LEN;
+            const ptr2 = passStringToWasm0(raw_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            const len2 = WASM_VECTOR_LEN;
+            wasm.rusthub_replace_snapshot(retptr, this.__wbg_ptr, ptr0, len0, ptr1, len1, ptr2, len2);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            deferred4_0 = r0;
+            deferred4_1 = r1;
+            return getStringFromWasm0(r0, r1);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_free(deferred4_0, deferred4_1, 1);
+        }
+    }
+    /**
+     * Drop the ingest retention pin (provider stop). The table frees now when
+     * no session holds it, else with the last disconnect. Returns "true" when
+     * the cache was freed here.
+     * @param {string} ds_id
+     * @param {string} params_json
+     * @returns {string}
+     */
+    drop_table(ds_id, params_json) {
+        let deferred3_0;
+        let deferred3_1;
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passStringToWasm0(ds_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            const len0 = WASM_VECTOR_LEN;
+            const ptr1 = passStringToWasm0(params_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            const len1 = WASM_VECTOR_LEN;
+            wasm.rusthub_drop_table(retptr, this.__wbg_ptr, ptr0, len0, ptr1, len1);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            deferred3_0 = r0;
+            deferred3_1 = r1;
+            return getStringFromWasm0(r0, r1);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_free(deferred3_0, deferred3_1, 1);
+        }
+    }
+    /**
      * Column-major snapshot of the whole cache for a datasource — the CSRM
      * snapshot. Returns `{"revision":R,"rowCount":N,"columns":{__key:[...],col:[...]}}`.
      * Built once from the columnar cache (all columns, no row objects); the worker
@@ -350,6 +470,27 @@ export class RustHub {
     session_count() {
         const ret = wasm.rusthub_session_count(this.__wbg_ptr);
         return ret >>> 0;
+    }
+    /**
+     * What this engine build can do — the client plane gates features on this
+     * instead of probing. Extend, never repurpose, these keys.
+     * @returns {string}
+     */
+    capabilities() {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            wasm.rusthub_capabilities(retptr, this.__wbg_ptr);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            deferred1_0 = r0;
+            deferred1_1 = r1;
+            return getStringFromWasm0(r0, r1);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+        }
     }
     /**
      * Diagnostics for the benchmark (datasource/view/row counts).

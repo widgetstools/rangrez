@@ -266,7 +266,7 @@ fn num(v: &Value) -> f64 { match v { Value::Int(i) => *i as f64, Value::Float(f)
 /// appearing and disappearing as the feed ticks, with nothing to point at.
 pub fn row_matches(cache: &TableCache, filter: &Filter, slot: usize) -> bool {
     if filter.is_empty() { return true; }
-    let get = |col: &str| cache.col_index(col).map(|ci| cache.cell(slot, ci).clone()).unwrap_or(Value::Null);
+    let get = |col: &str| cache.col_index(col).map(|ci| cache.query_value(slot, ci)).unwrap_or(Value::Null);
     filter.matches(&get)
 }
 
@@ -282,7 +282,7 @@ pub fn sort_slots(cache: &TableCache, slots: &mut [usize], keys: &[SortKey]) {
         .filter_map(|k| cache.col_index(&k.column).map(|ci| (ci, k.desc))).collect();
     slots.sort_by(|&x, &y| {
         for &(ci, desc) in &idx {
-            let ord = compare_values(cache.cell(x, ci), cache.cell(y, ci));
+            let ord = compare_values(&cache.query_value(x, ci), &cache.query_value(y, ci));
             let ord = if desc { ord.reverse() } else { ord };
             if ord != Ordering::Equal { return ord; }
         }
@@ -292,7 +292,7 @@ pub fn sort_slots(cache: &TableCache, slots: &mut [usize], keys: &[SortKey]) {
 
 /// A group-level aggregate function.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Agg { Sum, Avg, Min, Max, Count }
+pub enum Agg { Sum, Avg, Min, Max, Count, Median, Stdev, Variance, DistinctCount }
 
 impl Agg {
     pub fn parse(s: &str) -> Option<Agg> {
@@ -302,8 +302,19 @@ impl Agg {
             "min" => Agg::Min,
             "max" => Agg::Max,
             "count" => Agg::Count,
+            "median" => Agg::Median,
+            "stdev" | "stddev" => Agg::Stdev,
+            "variance" => Agg::Variance,
+            "distinct_count" | "distinctCount" => Agg::DistinctCount,
             _ => return None,
         })
+    }
+
+    /// Whether this aggregate needs every member value retained (not just the
+    /// running sum/min/max) — the accumulator collects a list only when a spec
+    /// actually asks for one of these.
+    fn needs_values(self) -> bool {
+        matches!(self, Agg::Median | Agg::Stdev | Agg::Variance)
     }
 }
 
@@ -319,13 +330,89 @@ pub struct GroupRow {
     pub aggregates: IndexMap<String, Value>,
 }
 
-struct Acc {
-    value: Value,
+/// Per-spec accumulation shared by grouped and flat aggregation — and by the
+/// view layer, which feeds it COMPUTED column values the cache cannot resolve.
+/// Blank and non-numeric cells are skipped (AG-Grid group-aggregate semantics;
+/// the expression language's own aggregate scalars use `expr::client_aggregate`
+/// instead, which follows the client's `toNum` folds).
+pub struct MultiAcc {
     count: usize,
-    sum: Vec<f64>,   // per spec
-    n: Vec<usize>,   // per spec, non-blank numeric count (for avg)
+    sum: Vec<f64>,
+    n: Vec<usize>,
     min: Vec<f64>,
     max: Vec<f64>,
+    /// Collected member values, only for specs whose agg `needs_values`.
+    vals: Vec<Vec<f64>>,
+    /// Distinct non-blank values (type-tagged), only for DistinctCount specs.
+    distinct: Vec<std::collections::HashSet<String>>,
+}
+
+impl MultiAcc {
+    pub fn new(specs: &[AggSpec]) -> MultiAcc {
+        MultiAcc {
+            count: 0,
+            sum: vec![0.0; specs.len()],
+            n: vec![0; specs.len()],
+            min: vec![f64::INFINITY; specs.len()],
+            max: vec![f64::NEG_INFINITY; specs.len()],
+            vals: specs.iter().map(|_| Vec::new()).collect(),
+            distinct: specs.iter().map(|_| std::collections::HashSet::new()).collect(),
+        }
+    }
+
+    /// Count one member row (independent of per-spec cells, for Count).
+    pub fn add_row(&mut self) { self.count += 1; }
+
+    /// Member rows folded so far.
+    pub fn count(&self) -> usize { self.count }
+
+    /// Fold one spec's cell for one member row.
+    pub fn add(&mut self, si: usize, spec: &AggSpec, cell: &Value) {
+        if spec.agg == Agg::DistinctCount {
+            if !is_blank(cell) { self.distinct[si].insert(group_key(cell)); }
+            return;
+        }
+        if is_blank(cell) { return; }
+        let x = to_number(cell);
+        if x.is_nan() { return; }
+        self.sum[si] += x;
+        self.n[si] += 1;
+        if x < self.min[si] { self.min[si] = x; }
+        if x > self.max[si] { self.max[si] = x; }
+        if spec.agg.needs_values() { self.vals[si].push(x); }
+    }
+
+    pub fn finish(mut self, specs: &[AggSpec]) -> IndexMap<String, Value> {
+        let mut out = IndexMap::new();
+        for (si, spec) in specs.iter().enumerate() {
+            let v = match spec.agg {
+                Agg::Sum => Value::Float(self.sum[si]),
+                Agg::Avg => if self.n[si] > 0 { Value::Float(self.sum[si] / self.n[si] as f64) } else { Value::Null },
+                Agg::Min => if self.n[si] > 0 { Value::Float(self.min[si]) } else { Value::Null },
+                Agg::Max => if self.n[si] > 0 { Value::Float(self.max[si]) } else { Value::Null },
+                Agg::Count => Value::Int(self.count as i64),
+                Agg::DistinctCount => Value::Int(self.distinct[si].len() as i64),
+                Agg::Median => {
+                    let vals = &mut self.vals[si];
+                    if vals.is_empty() { Value::Null } else {
+                        vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+                        let mid = vals.len() / 2;
+                        Value::Float(if vals.len() % 2 == 0 { (vals[mid - 1] + vals[mid]) / 2.0 } else { vals[mid] })
+                    }
+                }
+                Agg::Stdev | Agg::Variance => {
+                    let vals = &self.vals[si];
+                    if vals.len() <= 1 { Value::Null } else {
+                        let mean = self.sum[si] / vals.len() as f64;
+                        let var = vals.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>() / (vals.len() - 1) as f64;
+                        Value::Float(if spec.agg == Agg::Stdev { var.sqrt() } else { var })
+                    }
+                }
+            };
+            out.insert(spec.out.clone(), v);
+        }
+        out
+    }
 }
 
 /// Group filtered slots by one column and compute aggregates per group.
@@ -333,46 +420,22 @@ struct Acc {
 pub fn aggregate_groups(cache: &TableCache, slots: &[usize], group_col: &str, specs: &[AggSpec]) -> Vec<GroupRow> {
     let Some(gci) = cache.col_index(group_col) else { return Vec::new(); };
     let spec_idx: Vec<Option<usize>> = specs.iter().map(|s| cache.col_index(&s.column)).collect();
-    let mut groups: IndexMap<String, Acc> = IndexMap::new();
+    let mut groups: IndexMap<String, (Value, MultiAcc)> = IndexMap::new();
 
     for &slot in slots {
         let gv = cache.cell(slot, gci).clone();
         let gkey = group_key(&gv);
-        let acc = groups.entry(gkey).or_insert_with(|| Acc {
-            value: gv,
-            count: 0,
-            sum: vec![0.0; specs.len()],
-            n: vec![0; specs.len()],
-            min: vec![f64::INFINITY; specs.len()],
-            max: vec![f64::NEG_INFINITY; specs.len()],
-        });
-        acc.count += 1;
+        let (_, acc) = groups.entry(gkey).or_insert_with(|| (gv, MultiAcc::new(specs)));
+        acc.add_row();
         for (si, ci) in spec_idx.iter().enumerate() {
             let Some(ci) = ci else { continue; };
-            let cell = cache.cell(slot, *ci);
-            if is_blank(cell) { continue; }
-            let x = to_number(cell);
-            if x.is_nan() { continue; }
-            acc.sum[si] += x;
-            acc.n[si] += 1;
-            if x < acc.min[si] { acc.min[si] = x; }
-            if x > acc.max[si] { acc.max[si] = x; }
+            acc.add(si, &specs[si], &cache.query_value(slot, *ci));
         }
     }
 
-    groups.into_iter().map(|(_, acc)| {
-        let mut aggregates = IndexMap::new();
-        for (si, spec) in specs.iter().enumerate() {
-            let v = match spec.agg {
-                Agg::Sum => Value::Float(acc.sum[si]),
-                Agg::Avg => if acc.n[si] > 0 { Value::Float(acc.sum[si] / acc.n[si] as f64) } else { Value::Null },
-                Agg::Min => if acc.n[si] > 0 { Value::Float(acc.min[si]) } else { Value::Null },
-                Agg::Max => if acc.n[si] > 0 { Value::Float(acc.max[si]) } else { Value::Null },
-                Agg::Count => Value::Int(acc.count as i64),
-            };
-            aggregates.insert(spec.out.clone(), v);
-        }
-        GroupRow { value: acc.value, count: acc.count, aggregates }
+    groups.into_iter().map(|(_, (value, acc))| {
+        let count = acc.count();
+        GroupRow { value, count, aggregates: acc.finish(specs) }
     }).collect()
 }
 
@@ -472,33 +535,13 @@ mod engine_tests {
 /// The same accumulation as `aggregate_groups`, collapsed to one group.
 pub fn aggregate_over(cache: &TableCache, slots: &[usize], specs: &[AggSpec]) -> IndexMap<String, Value> {
     let spec_idx: Vec<Option<usize>> = specs.iter().map(|s| cache.col_index(&s.column)).collect();
-    let mut sum = vec![0.0f64; specs.len()];
-    let mut n = vec![0usize; specs.len()];
-    let mut mn = vec![f64::INFINITY; specs.len()];
-    let mut mx = vec![f64::NEG_INFINITY; specs.len()];
-    let total = slots.len();
+    let mut acc = MultiAcc::new(specs);
     for &slot in slots {
+        acc.add_row();
         for (si, ci) in spec_idx.iter().enumerate() {
             let Some(ci) = ci else { continue; };
-            let cell = cache.cell(slot, *ci);
-            if is_blank(cell) { continue; }
-            let x = to_number(cell);
-            if x.is_nan() { continue; }
-            sum[si] += x; n[si] += 1;
-            if x < mn[si] { mn[si] = x; }
-            if x > mx[si] { mx[si] = x; }
+            acc.add(si, &specs[si], &cache.query_value(slot, *ci));
         }
     }
-    let mut out = IndexMap::new();
-    for (si, spec) in specs.iter().enumerate() {
-        let v = match spec.agg {
-            Agg::Sum => Value::Float(sum[si]),
-            Agg::Avg => if n[si] > 0 { Value::Float(sum[si] / n[si] as f64) } else { Value::Null },
-            Agg::Min => if n[si] > 0 { Value::Float(mn[si]) } else { Value::Null },
-            Agg::Max => if n[si] > 0 { Value::Float(mx[si]) } else { Value::Null },
-            Agg::Count => Value::Int(total as i64),
-        };
-        out.insert(spec.out.clone(), v);
-    }
-    out
+    acc.finish(specs)
 }

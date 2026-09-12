@@ -56,6 +56,32 @@ export class RustHub {
    */
   apply_message_json(ds_id: string, params_json: string, raw_json: string): string;
   /**
+   * Delete rows by key (a JSON array of key strings). Deletions ride the
+   * delta stream like any other change, so subscribed grids receive them as
+   * `removals`. Returns `"[deleted]"`.
+   */
+  delete_rows(ds_id: string, params_json: string, keys_json: string): string;
+  /**
+   * Remove every row, keeping the schema and the table itself (and its
+   * subscriptions). One revision; the delta stream sees the truncation as
+   * removals. Returns `"[removed]"`.
+   */
+  truncate(ds_id: string, params_json: string): string;
+  /**
+   * Atomic truncate + ingest, in ONE revision — restart semantics: after it
+   * the table holds exactly the rows sent, so a snapshot that SHRANK no
+   * longer leaves stale keys rendering as current. Keys that survive the
+   * replace are never emitted as removals (`changed_since` drops a deletion
+   * superseded by a live re-upsert). Returns `"[upserts,truncated]"`.
+   */
+  replace_snapshot(ds_id: string, params_json: string, raw_json: string): string;
+  /**
+   * Drop the ingest retention pin (provider stop). The table frees now when
+   * no session holds it, else with the last disconnect. Returns "true" when
+   * the cache was freed here.
+   */
+  drop_table(ds_id: string, params_json: string): string;
+  /**
    * Column-major snapshot of the whole cache for a datasource — the CSRM
    * snapshot. Returns `{"revision":R,"rowCount":N,"columns":{__key:[...],col:[...]}}`.
    * Built once from the columnar cache (all columns, no row objects); the worker
@@ -81,6 +107,11 @@ export class RustHub {
    */
   session_count(): number;
   /**
+   * What this engine build can do — the client plane gates features on this
+   * instead of probing. Extend, never repurpose, these keys.
+   */
+  capabilities(): string;
+  /**
    * Diagnostics for the benchmark (datasource/view/row counts).
    */
   mem_stats(): string;
@@ -98,10 +129,15 @@ export interface InitOutput {
   readonly rusthub_on_control: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
   readonly rusthub_tick: (a: number, b: number) => void;
   readonly rusthub_apply_message_json: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
+  readonly rusthub_delete_rows: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
+  readonly rusthub_truncate: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
+  readonly rusthub_replace_snapshot: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
+  readonly rusthub_drop_table: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
   readonly rusthub_snapshot_columns: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
   readonly rusthub_poll_shared_delta: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
   readonly rusthub_rewind_shared_delta: (a: number, b: number, c: number, d: number, e: number, f: bigint) => void;
   readonly rusthub_session_count: (a: number) => number;
+  readonly rusthub_capabilities: (a: number, b: number) => void;
   readonly rusthub_mem_stats: (a: number, b: number) => void;
   readonly __wbindgen_add_to_stack_pointer: (a: number) => number;
   readonly __wbindgen_malloc: (a: number, b: number) => number;

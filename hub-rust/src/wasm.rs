@@ -21,6 +21,11 @@ use serde_json::{json, Value as Json};
 use std::collections::HashMap;
 use wasm_bindgen::prelude::*;
 
+/// Entered rows materialized per viewDelta push. Key lists are complete; a
+/// burst that swings more rows than this still names them all, the payload
+/// just stops carrying full rows (the client fetches what it needs).
+const VIEW_DELTA_ROW_CAP: usize = 200;
+
 /// One shared hub + a map of per-port sessions. Held alive by JS across calls.
 ///
 /// `shared_deltas` is the O(1) row-delta path: one `DeltaSub` per cache key, polled
@@ -109,11 +114,26 @@ impl RustHub {
     /// so the worker routes each session's pushes to its own port. The JS interval
     /// that calls this IS the delivery conflation window.
     pub fn tick(&mut self) -> String {
+        // Membership deltas for watch-flagged views, routed to the session that
+        // opened each view. Collected before the session loop so the `&mut`
+        // borrows of `hub.views` and `sessions` never overlap.
+        let mut view_deltas: HashMap<String, Vec<Json>> = HashMap::new();
+        for (vid, view) in self.hub.views.iter_mut() {
+            let Some((entered, left, rows)) = view.membership_delta(VIEW_DELTA_ROW_CAP) else { continue; };
+            let Some(sid) = self.sessions.iter()
+                .find(|(_, s)| s.open_views.contains(vid))
+                .map(|(k, _)| k.clone()) else { continue; };
+            view_deltas.entry(sid).or_default().push(json!({
+                "type": "viewDelta", "viewId": vid,
+                "entered": entered, "left": left, "rows": rows,
+            }));
+        }
         let mut per_session: Vec<Json> = Vec::new();
         for (sid, session) in self.sessions.iter_mut() {
             // Row deltas come from the SHARED stream (poll_shared_delta); here we
-            // emit only the per-session group deltas + alerts.
+            // emit only the per-session group deltas + view deltas + alerts.
             let mut msgs = session.poll_group_deltas();
+            msgs.extend(view_deltas.remove(sid).unwrap_or_default());
             msgs.extend(session.poll_alerts(None));
 
             let mut out: Vec<Json> = Vec::new();
@@ -154,7 +174,12 @@ impl RustHub {
         let Some(ds) = self.hub.registry.datasource(ds_id).cloned() else {
             return "[0,0]".into();
         };
-        let Some(cache) = self.hub.registry.cache_for(ds_id, &params) else {
+        // Get-or-create AND pin: ingest declares the table should exist, and
+        // retention follows the data. Before this, rows applied while no
+        // session was subscribed hit `cache_for` → None and were silently
+        // dropped — the cold-start data loss the worker's anchor session
+        // worked around.
+        let Ok(cache) = self.hub.registry.ensure_pinned(ds_id, &params) else {
             return "[0,0]".into();
         };
         let (up, del) = {
@@ -162,6 +187,70 @@ impl RustHub {
             apply_message(&mut guard, &ds, &raw)
         };
         format!("[{up},{del}]")
+    }
+
+    /// Delete rows by key (a JSON array of key strings). Deletions ride the
+    /// delta stream like any other change, so subscribed grids receive them as
+    /// `removals`. Returns `"[deleted]"`.
+    pub fn delete_rows(&mut self, ds_id: &str, params_json: &str, keys_json: &str) -> String {
+        let params: Json = serde_json::from_str(params_json).unwrap_or_else(|_| json!({}));
+        let keys: Vec<String> = serde_json::from_str(keys_json).unwrap_or_default();
+        let Some(cache) = self.hub.registry.cache_for(ds_id, &params) else {
+            return "[0]".into();
+        };
+        let mut guard = cache.lock().unwrap();
+        guard.begin_batch();
+        let mut n = 0usize;
+        for k in &keys {
+            if guard.delete(k) { n += 1; }
+        }
+        guard.end_batch();
+        format!("[{n}]")
+    }
+
+    /// Remove every row, keeping the schema and the table itself (and its
+    /// subscriptions). One revision; the delta stream sees the truncation as
+    /// removals. Returns `"[removed]"`.
+    pub fn truncate(&mut self, ds_id: &str, params_json: &str) -> String {
+        let params: Json = serde_json::from_str(params_json).unwrap_or_else(|_| json!({}));
+        let Some(cache) = self.hub.registry.cache_for(ds_id, &params) else {
+            return "[0]".into();
+        };
+        let n = cache.lock().unwrap().truncate();
+        format!("[{n}]")
+    }
+
+    /// Atomic truncate + ingest, in ONE revision — restart semantics: after it
+    /// the table holds exactly the rows sent, so a snapshot that SHRANK no
+    /// longer leaves stale keys rendering as current. Keys that survive the
+    /// replace are never emitted as removals (`changed_since` drops a deletion
+    /// superseded by a live re-upsert). Returns `"[upserts,truncated]"`.
+    pub fn replace_snapshot(&mut self, ds_id: &str, params_json: &str, raw_json: &str) -> String {
+        let params: Json = serde_json::from_str(params_json).unwrap_or_else(|_| json!({}));
+        let raw: Json = match serde_json::from_str(raw_json) {
+            Ok(r) => r,
+            Err(_) => return "[0,0]".into(),
+        };
+        let Some(ds) = self.hub.registry.datasource(ds_id).cloned() else {
+            return "[0,0]".into();
+        };
+        let Ok(cache) = self.hub.registry.ensure_pinned(ds_id, &params) else {
+            return "[0,0]".into();
+        };
+        let mut guard = cache.lock().unwrap();
+        guard.begin_batch();
+        let removed = guard.truncate();
+        let (up, _) = apply_message(&mut guard, &ds, &raw);
+        guard.end_batch();
+        format!("[{up},{removed}]")
+    }
+
+    /// Drop the ingest retention pin (provider stop). The table frees now when
+    /// no session holds it, else with the last disconnect. Returns "true" when
+    /// the cache was freed here.
+    pub fn drop_table(&mut self, ds_id: &str, params_json: &str) -> String {
+        let params: Json = serde_json::from_str(params_json).unwrap_or_else(|_| json!({}));
+        self.hub.registry.unpin(ds_id, &params).to_string()
     }
 
     /// Column-major snapshot of the whole cache for a datasource — the CSRM
@@ -227,6 +316,19 @@ impl RustHub {
     /// Number of live sessions (subscribers) this hub is serving.
     pub fn session_count(&self) -> usize {
         self.sessions.len()
+    }
+
+    /// What this engine build can do — the client plane gates features on this
+    /// instead of probing. Extend, never repurpose, these keys.
+    pub fn capabilities(&self) -> String {
+        json!({
+            "exprContract": 1,
+            "computedColumns": true,
+            "aggregates": ["sum", "avg", "count", "min", "max", "median", "stdev", "variance", "distinct_count"],
+            "viewDeltas": true,
+            "dateColumns": true,
+            "pivotWithoutGroups": true,
+        }).to_string()
     }
 
     /// Diagnostics for the benchmark (datasource/view/row counts).

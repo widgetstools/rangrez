@@ -7,14 +7,20 @@
 //! flattened tree — "one view for the entire tree, mutated in place" — which is
 //! exactly what AG-Grid's VRM expects and what `expandRow` drives.
 
-use crate::query::{
-    aggregate_over, filtered_slots, group_key_string, group_slots, row_matches, sort_slots,
-    AggSpec, Agg, Filter, SortKey,
-};
+use crate::expr::{client_aggregate, Expr};
+use crate::query::{compare_values, group_key_string, AggSpec, Agg, Filter, MultiAcc, SortKey};
 use crate::store::{TableCache, Value};
 use serde_json::{json, Value as Json};
+use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
+
+/// One computed column: engine-evaluated per row, addressable by the same
+/// view's filter / sort / groupBy / aggregates under its `as` name.
+pub struct ComputedCol {
+    pub name: String,
+    pub expr: Expr,
+}
 
 /// A parsed view spec.
 pub struct ViewSpec {
@@ -22,6 +28,15 @@ pub struct ViewSpec {
     pub sort: Vec<SortKey>,
     pub group_cols: Vec<String>,
     pub aggs: Vec<AggSpec>,
+    /// Computed columns (client expression contract wire form, `[{as, expr}]`).
+    pub computed: Vec<ComputedCol>,
+    /// Computed entries that failed to parse. NON-EMPTY MUST REJECT THE VIEW
+    /// (`Hub::open_view` does): a spec that half-parses would filter on a
+    /// different predicate than it displays.
+    pub computed_errors: Vec<String>,
+    /// Membership watch: when set, the owner is told which rows ENTER and
+    /// LEAVE the filtered set each revision (`View::membership_delta`).
+    pub watch: bool,
     /// Pivot columns. Each group's aggregates are split by the distinct values
     /// of these columns, producing `<splitValue>|<aggColumn>` fields.
     ///
@@ -60,7 +75,21 @@ impl ViewSpec {
         let split_cols = spec.get("splitBy").and_then(Json::as_array)
             .map(|a| a.iter().filter_map(|c| c.as_str().map(str::to_string)).collect())
             .unwrap_or_default();
-        ViewSpec { filter, sort, group_cols, aggs, split_cols }
+        let mut computed = Vec::new();
+        let mut computed_errors = Vec::new();
+        if let Some(arr) = spec.get("computed").and_then(Json::as_array) {
+            for c in arr {
+                let name = c.get("as").and_then(Json::as_str).unwrap_or("").to_string();
+                if name.is_empty() { computed_errors.push("computed column without `as`".into()); continue; }
+                match c.get("expr").map(Expr::from_wire) {
+                    Some(Ok(expr)) => computed.push(ComputedCol { name, expr }),
+                    Some(Err(err)) => computed_errors.push(format!("computed \"{name}\": {err}")),
+                    None => computed_errors.push(format!("computed \"{name}\": missing expr")),
+                }
+            }
+        }
+        let watch = spec.get("watch").and_then(Json::as_bool).unwrap_or(false);
+        ViewSpec { filter, sort, group_cols, aggs, split_cols, computed, computed_errors, watch }
     }
 }
 
@@ -98,6 +127,29 @@ pub struct View {
     order_builds: u64,
     tree_builds: u64,
     order_patches: u64,
+    /// Computed-column values, memoized per cache revision (patched via the
+    /// touch log like the slot memo). Present only when the spec has computed
+    /// columns. Refreshed FIRST in `refresh_memo` — the filter may read them.
+    computed_memo: Option<ComputedMemo>,
+    /// Every `agg` node in the computed expressions, deduplicated, in first-seen
+    /// order — `ComputedMemo::aggs` is parallel to this.
+    agg_refs: Vec<(String, String)>,
+    /// Membership-watch state: the filtered set's keys at the last delta, and
+    /// the revision it was taken at.
+    watch_keys: Option<HashSet<String>>,
+    watch_rev: u64,
+}
+
+/// Computed values for every cache slot, plus the aggregate scalars they were
+/// evaluated under, valid for one cache revision.
+struct ComputedMemo {
+    revision: u64,
+    /// `[computed idx][cache slot]` — sized to `slot_count`, Null on dead slots.
+    values: Vec<Vec<Value>>,
+    /// Aggregate scalars, parallel to `View::agg_refs`. CLIENT fold semantics
+    /// (`expr::client_aggregate`) over the view's FILTERED rows — the same row
+    /// set the client's `getAggregates({filterModel})` binder resolves over.
+    aggs: Vec<Value>,
 }
 
 /// A materialized slot order plus the revision that produced it.
@@ -139,8 +191,212 @@ const TREE_MEMO_MAX_ROWS: usize = 50_000;
 
 impl View {
     pub fn new(cache: Arc<Mutex<TableCache>>, spec: ViewSpec, session_id: String) -> View {
+        let mut agg_refs: Vec<(String, String)> = Vec::new();
+        for cc in &spec.computed {
+            let mut refs = Vec::new();
+            cc.expr.agg_refs(&mut refs);
+            for r in refs { if !agg_refs.contains(&r) { agg_refs.push(r); } }
+        }
         View { cache, spec, session_id, expanded: HashSet::new(), memo: None, tree: None, expand_gen: 0,
-               order_builds: 0, tree_builds: 0, order_patches: 0 }
+               order_builds: 0, tree_builds: 0, order_patches: 0,
+               computed_memo: None, agg_refs, watch_keys: None, watch_rev: 0 }
+    }
+
+    // ------------------------------------------------------ computed columns
+
+    fn computed_idx(&self, name: &str) -> Option<usize> {
+        self.spec.computed.iter().position(|c| c.name == name)
+    }
+
+    /// A cell as the QUERY layer sees it: computed columns from the memo,
+    /// date-typed cache columns as parsed epochs, everything else as stored.
+    /// Filter and sort go through this.
+    fn view_value(&self, cache: &TableCache, slot: usize, name: &str) -> Value {
+        if let Some(k) = self.computed_idx(name) {
+            return self.computed_memo.as_ref()
+                .and_then(|m| m.values[k].get(slot).cloned())
+                .unwrap_or(Value::Null);
+        }
+        cache.col_index(name).map(|ci| cache.query_value(slot, ci)).unwrap_or(Value::Null)
+    }
+
+    /// A cell as DISPLAY sees it: computed from the memo, cache columns as
+    /// stored (a date column groups and pivots under its string, not its
+    /// epoch). Grouping and pivot keys go through this.
+    fn display_value(&self, cache: &TableCache, slot: usize, name: &str) -> Value {
+        if let Some(k) = self.computed_idx(name) {
+            return self.computed_memo.as_ref()
+                .and_then(|m| m.values[k].get(slot).cloned())
+                .unwrap_or(Value::Null);
+        }
+        cache.col_index(name).map(|ci| cache.cell(slot, ci).clone()).unwrap_or(Value::Null)
+    }
+
+    /// Does one slot pass the view filter? The single membership predicate —
+    /// rebuild, patch and the aggregate-scalar row set all route through it,
+    /// so they cannot disagree.
+    fn row_in_view(&self, cache: &TableCache, slot: usize) -> bool {
+        if self.spec.filter.is_empty() { return true; }
+        let get = |col: &str| self.view_value(cache, slot, col);
+        self.spec.filter.matches(&get)
+    }
+
+    /// Multi-key sort resolving computed and date-typed columns. Stable.
+    fn sort_view(&self, cache: &TableCache, slots: &mut [usize]) {
+        enum K { Cache(usize), Comp(usize) }
+        let keys: Vec<(K, bool)> = self.spec.sort.iter().filter_map(|k| {
+            if let Some(i) = self.computed_idx(&k.column) { return Some((K::Comp(i), k.desc)); }
+            cache.col_index(&k.column).map(|ci| (K::Cache(ci), k.desc))
+        }).collect();
+        if keys.is_empty() { return; }
+        let val = |slot: usize, k: &K| -> Value {
+            match k {
+                K::Cache(ci) => cache.query_value(slot, *ci),
+                K::Comp(i) => self.computed_memo.as_ref()
+                    .and_then(|m| m.values[*i].get(slot).cloned())
+                    .unwrap_or(Value::Null),
+            }
+        };
+        slots.sort_by(|&x, &y| {
+            for (k, desc) in &keys {
+                let ord = compare_values(&val(x, k), &val(y, k));
+                let ord = if *desc { ord.reverse() } else { ord };
+                if ord != Ordering::Equal { return ord; }
+            }
+            Ordering::Equal
+        });
+    }
+
+    /// Recompute the computed-value memo for the current revision. Runs BEFORE
+    /// the slot memo refresh — membership reads computed values.
+    ///
+    /// Aggregate scalars converge in one step: values are evaluated under the
+    /// PREVIOUS revision's scalars, the scalars are re-derived over the view's
+    /// filtered rows, and if they moved, values are evaluated once more. A
+    /// filter that reads an agg-dependent computed column can therefore lag the
+    /// scalar by one revision — exactly the client's own temporal behaviour
+    /// (its binder refreshes aggregates async and reads the last known value).
+    fn refresh_computed(&mut self, cache: &TableCache) {
+        if self.spec.computed.is_empty() { return; }
+        let revision = cache.revision();
+        if matches!(&self.computed_memo, Some(m) if m.revision == revision) { return; }
+
+        let ncols = self.spec.computed.len();
+        let nslots = cache.slot_count();
+        let (mut values, prev_aggs, patch_from) = match self.computed_memo.take() {
+            Some(m) => { let from = m.revision; (m.values, m.aggs, Some(from)) }
+            None => (vec![Vec::new(); ncols], vec![Value::Null; self.agg_refs.len()], None),
+        };
+        for col in values.iter_mut() { col.resize(nslots, Value::Null); }
+
+        let touched = patch_from.and_then(|f| cache.touched_since(f));
+        let full: Vec<usize>;
+        let slots: &[usize] = match &touched {
+            Some(t) => t,
+            None => { full = cache.live_slots().collect(); &full }
+        };
+        self.compute_values_into(cache, slots, &prev_aggs, &mut values);
+
+        let mut aggs = prev_aggs;
+        if !self.agg_refs.is_empty() {
+            // Membership under the values just computed. Cannot use
+            // `row_in_view` — the memo is taken out — so inline the same get.
+            let filtered: Vec<usize> = cache.live_slots().filter(|&slot| {
+                if self.spec.filter.is_empty() { return true; }
+                let get = |col: &str| {
+                    if let Some(k) = self.computed_idx(col) {
+                        return values[k].get(slot).cloned().unwrap_or(Value::Null);
+                    }
+                    cache.col_index(col).map(|ci| cache.query_value(slot, ci)).unwrap_or(Value::Null)
+                };
+                self.spec.filter.matches(&get)
+            }).collect();
+            let next: Vec<Value> = self.agg_refs.iter().map(|(f, c)| {
+                let mut it = filtered.iter().map(|&slot| {
+                    if let Some(k) = self.computed_idx(c) {
+                        values[k].get(slot).cloned().unwrap_or(Value::Null)
+                    } else {
+                        cache.col_index(c).map(|ci| cache.cell(slot, ci).clone()).unwrap_or(Value::Null)
+                    }
+                });
+                client_aggregate(f, &mut it)
+            }).collect();
+            let moved = next.len() != aggs.len()
+                || next.iter().zip(&aggs).any(|(a, b)| !agg_value_eq(a, b));
+            if moved {
+                let all: Vec<usize> = cache.live_slots().collect();
+                self.compute_values_into(cache, &all, &next, &mut values);
+            }
+            aggs = next;
+        }
+
+        self.computed_memo = Some(ComputedMemo { revision, values, aggs });
+    }
+
+    /// Evaluate every computed column for the given slots, writing into
+    /// `values`. Expressions see RAW cache cells (the client evaluates over
+    /// display values — `YEAR([tradeDate])` parses the string, not an epoch)
+    /// and earlier computed columns of the same pass.
+    fn compute_values_into(&self, cache: &TableCache, slots: &[usize], aggs: &[Value], values: &mut [Vec<Value>]) {
+        for &slot in slots {
+            if !cache.is_live(slot) {
+                for col in values.iter_mut() { if let Some(v) = col.get_mut(slot) { *v = Value::Null; } }
+                continue;
+            }
+            let mut rowvals: Vec<Value> = Vec::with_capacity(self.spec.computed.len());
+            for cc in &self.spec.computed {
+                let get = |name: &str| -> Value {
+                    if let Some(j) = self.computed_idx(name) {
+                        if j < rowvals.len() { return rowvals[j].clone(); }
+                        return values[j].get(slot).cloned().unwrap_or(Value::Null);
+                    }
+                    cache.col_index(name).map(|ci| cache.cell(slot, ci).clone()).unwrap_or(Value::Null)
+                };
+                let agg = |f: &str, c: &str| -> Value {
+                    self.agg_refs.iter().position(|(af, ac)| af == f && ac == c)
+                        .and_then(|i| aggs.get(i).cloned())
+                        .unwrap_or(Value::Null)
+                };
+                rowvals.push(cc.expr.eval(&get, &agg));
+            }
+            for (k, v) in rowvals.into_iter().enumerate() { values[k][slot] = v; }
+        }
+    }
+
+    /// Append the computed fields to a leaf row's JSON.
+    fn augment_row(&self, row: &mut Json, slot: usize) {
+        let Some(memo) = self.computed_memo.as_ref() else { return; };
+        if let Json::Object(o) = row {
+            for (k, cc) in self.spec.computed.iter().enumerate() {
+                o.insert(cc.name.clone(), memo.values[k].get(slot).map(Value::to_json).unwrap_or(Json::Null));
+            }
+        }
+    }
+
+    /// Group slots by one column's DISPLAY value (computed columns included),
+    /// first-seen order.
+    fn group_slots_view(&self, cache: &TableCache, slots: &[usize], col: &str) -> Vec<(Value, Vec<usize>)> {
+        let mut map: indexmap::IndexMap<String, (Value, Vec<usize>)> = indexmap::IndexMap::new();
+        for &slot in slots {
+            let gv = self.display_value(cache, slot, col);
+            let key = group_key_string(&gv);
+            map.entry(key).or_insert_with(|| (gv, Vec::new())).1.push(slot);
+        }
+        map.into_iter().map(|(_, v)| v).collect()
+    }
+
+    /// Aggregate over slots, resolving computed columns through the memo and
+    /// cache columns through `query_value` — the same accumulation as
+    /// `query::aggregate_over`.
+    fn aggregate_over_view(&self, cache: &TableCache, slots: &[usize], specs: &[AggSpec]) -> indexmap::IndexMap<String, Value> {
+        let mut acc = MultiAcc::new(specs);
+        for &slot in slots {
+            acc.add_row();
+            for (si, spec) in specs.iter().enumerate() {
+                acc.add(si, spec, &self.view_value(cache, slot, &spec.column));
+            }
+        }
+        acc.finish(specs)
     }
 
     /// Rebuild the slot order if the cache has moved since it was built.
@@ -148,6 +404,7 @@ impl View {
     /// Deliberately keyed on revision alone, not on expansion state: expanding a
     /// group changes which rows are VISIBLE, never which rows pass the filter.
     fn refresh_memo(&mut self, cache: &TableCache) {
+        self.refresh_computed(cache);
         let revision = cache.revision();
         let prev = match &self.memo {
             Some(m) if m.revision == revision => return,
@@ -169,9 +426,11 @@ impl View {
     }
 
     fn rebuild_memo(&mut self, cache: &TableCache, revision: u64) {
-        let mut slots = filtered_slots(cache, &self.spec.filter);
+        let mut slots: Vec<usize> = cache.live_slots()
+            .filter(|&slot| self.row_in_view(cache, slot))
+            .collect();
         if self.spec.group_cols.is_empty() {
-            sort_slots(cache, &mut slots, &self.spec.sort);
+            self.sort_view(cache, &mut slots);
         }
         let mut member = vec![false; cache.slot_count()];
         for &s in &slots { member[s] = true; }
@@ -188,12 +447,16 @@ impl View {
     /// re-sort a flat view because a touched row's sort key may have changed
     /// even when its membership did not.
     fn patch_memo(&mut self, cache: &TableCache, revision: u64, touched: &[usize]) {
+        // Membership decisions first — the predicate reads the computed memo
+        // (an `&self` borrow), which cannot overlap the slot memo's `&mut`.
+        let decisions: Vec<(usize, bool)> = touched.iter()
+            .map(|&slot| (slot, cache.is_live(slot) && self.row_in_view(cache, slot)))
+            .collect();
         let Some(memo) = self.memo.as_mut() else { return self.rebuild_memo(cache, revision) };
         if memo.member.len() < cache.slot_count() { memo.member.resize(cache.slot_count(), false); }
 
         let mut dirty = false;
-        for &slot in touched {
-            let now_in = cache.is_live(slot) && row_matches(cache, &self.spec.filter, slot);
+        for (slot, now_in) in decisions {
             if memo.member[slot] != now_in { memo.member[slot] = now_in; dirty = true; }
         }
 
@@ -204,12 +467,14 @@ impl View {
         // a flat view reorders whenever anything moved — not only when membership
         // changed. A grouped view does not: it sorts leaves within each group.
         let needs_sort = self.spec.group_cols.is_empty() && !touched.is_empty();
-        if needs_sort {
-            let mut slots = std::mem::take(&mut memo.slots);
-            sort_slots(cache, &mut slots, &self.spec.sort);
-            memo.slots = slots;
-        }
         memo.revision = revision;
+        if needs_sort {
+            // Move the slots out so the sort (an `&self` read of the computed
+            // memo) does not overlap the slot memo's `&mut` borrow.
+            let mut slots = std::mem::take(&mut memo.slots);
+            self.sort_view(cache, &mut slots);
+            if let Some(m) = self.memo.as_mut() { m.slots = slots; }
+        }
         self.order_patches += 1;
     }
 
@@ -259,8 +524,13 @@ impl View {
         let cache = cache_arc.lock().unwrap();
         self.refresh_memo(&cache);
         if self.spec.group_cols.is_empty() {
+            if !self.spec.split_cols.is_empty() {
+                return vec![self.pivot_total_row(&cache)];
+            }
             let mut out = Vec::new();
-            for &s in self.slots() { if let Some(r) = cache.row_json(s) { out.push(r); } }
+            for s in self.slots().to_vec() {
+                if let Some(mut r) = cache.row_json(s) { self.augment_row(&mut r, s); out.push(r); }
+            }
             return out;
         }
         match self.refresh_tree(&cache) {
@@ -271,7 +541,7 @@ impl View {
 
     fn emit_level(&self, cache: &TableCache, slots: &[usize], path: &[String], level: usize, out: &mut Vec<Json>) {
         let group_col = &self.spec.group_cols[level];
-        let mut groups = group_slots(cache, slots, group_col);
+        let mut groups = self.group_slots_view(cache, slots, group_col);
         // Order groups by the group column under the sort model (if it targets it),
         // else by value ascending for a stable tree.
         let desc = self.spec.sort.iter().find(|s| &s.column == group_col).map(|s| s.desc).unwrap_or(false);
@@ -284,7 +554,7 @@ impl View {
             gpath.push(group_key_string(&value));
             let expanded = self.expanded.contains(&gpath);
             let aggregates = if self.spec.split_cols.is_empty() {
-                aggregate_over(cache, &member_slots, &self.spec.aggs)
+                self.aggregate_over_view(cache, &member_slots, &self.spec.aggs)
             } else {
                 self.aggregate_split(cache, &member_slots)
             };
@@ -294,8 +564,10 @@ impl View {
                     self.emit_level(cache, &member_slots, &gpath, level + 1, out);
                 } else {
                     let mut leaves = member_slots;
-                    sort_slots(cache, &mut leaves, &self.spec.sort);
-                    for s in leaves { if let Some(r) = cache.row_json(s) { out.push(r); } }
+                    self.sort_view(cache, &mut leaves);
+                    for s in leaves {
+                        if let Some(mut r) = cache.row_json(s) { self.augment_row(&mut r, s); out.push(r); }
+                    }
                 }
             }
         }
@@ -318,12 +590,13 @@ impl View {
         cache: &TableCache,
         slots: &[usize],
     ) -> indexmap::IndexMap<String, Value> {
-        let idx: Vec<Option<usize>> =
-            self.spec.split_cols.iter().map(|c| cache.col_index(c)).collect();
         let mut buckets: indexmap::IndexMap<String, Vec<usize>> = indexmap::IndexMap::new();
         for &slot in slots {
-            let key = idx.iter()
-                .map(|ci| ci.map(|ci| split_key_string(cache.cell(slot, ci))).unwrap_or_default())
+            // A split VALUE containing the separator would parse as extra pivot
+            // levels client-side, so it is folded to a lookalike (`¦`). Computed
+            // split columns resolve like any other.
+            let key = self.spec.split_cols.iter()
+                .map(|c| split_key_string(&self.display_value(cache, slot, c)).replace('|', "\u{00A6}"))
                 .collect::<Vec<_>>()
                 .join("|");
             buckets.entry(key).or_default().push(slot);
@@ -332,14 +605,29 @@ impl View {
 
         let mut out = indexmap::IndexMap::new();
         for (key, member_slots) in buckets {
-            for (name, value) in aggregate_over(cache, &member_slots, &self.spec.aggs) {
+            for (name, value) in self.aggregate_over_view(cache, &member_slots, &self.spec.aggs) {
                 out.insert(format!("{key}|{name}"), value);
             }
         }
         out
     }
 
+    /// The single grand-total row of a GROUP-LESS pivot (`pivotMode` with no
+    /// row groups): every filtered row aggregated, split by the pivot columns.
+    fn pivot_total_row(&mut self, cache: &TableCache) -> Json {
+        self.refresh_memo(cache);
+        let slots = self.slots().to_vec();
+        let aggregates = self.aggregate_split(cache, &slots);
+        let mut o = serde_json::Map::new();
+        o.insert("__key".into(), json!("__pivotTotal"));
+        o.insert("__pivotTotal".into(), json!(true));
+        o.insert("__count".into(), json!(slots.len()));
+        for (k, v) in aggregates { o.insert(k, v.to_json()); }
+        Json::Object(o)
+    }
+
     pub fn num_rows(&mut self) -> usize {
+        if self.spec.group_cols.is_empty() && !self.spec.split_cols.is_empty() { return 1; }
         // A flat view's row count is just its filtered slot count — building JSON
         // for every row only to count them is the same waste `read_window` avoids.
         if self.spec.group_cols.is_empty() {
@@ -363,11 +651,21 @@ impl View {
         self.refresh_memo(&cache);
 
         if self.spec.group_cols.is_empty() {
-            let leaves = self.slots();
+            if !self.spec.split_cols.is_empty() {
+                // Group-less pivot: one grand-total row carrying the pivot fields.
+                let row = self.pivot_total_row(&cache);
+                let rows = if start == 0 && end.map_or(true, |e| e > 0) { vec![row] } else { Vec::new() };
+                return (rows, 1);
+            }
+            let leaves = self.slots().to_vec();
             let total = leaves.len();
             let e = end.unwrap_or(total).min(total);
             let s = start.min(e);
-            let rows: Vec<Json> = leaves[s..e].iter().filter_map(|&sl| cache.row_json(sl)).collect();
+            let rows: Vec<Json> = leaves[s..e].iter().filter_map(|&sl| {
+                let mut r = cache.row_json(sl)?;
+                self.augment_row(&mut r, sl);
+                Some(r)
+            }).collect();
             return (rows, total);
         }
 
@@ -406,6 +704,59 @@ impl View {
         // would keep serving the tree shape from before the expansion.
         self.expand_gen += 1;
         Ok(self.num_rows())
+    }
+
+    /// Which rows ENTERED and LEFT the filtered set since the last call —
+    /// the per-view membership delta a watch-flagged view reports each tick.
+    ///
+    /// The first call PRIMES silently (rows already in the set when the watch
+    /// starts are not "entered" — the client alert bridge fires on
+    /// transitions, exactly like the CSRM dispatcher). `None` means watch off,
+    /// nothing changed, or priming. Entered rows are materialized up to `cap`;
+    /// `entered`/`left` key lists are always complete.
+    pub fn membership_delta(&mut self, cap: usize) -> Option<(Vec<String>, Vec<String>, Vec<Json>)> {
+        if !self.spec.watch { return None; }
+        let cache_arc = self.cache.clone();
+        let cache = cache_arc.lock().unwrap();
+        let revision = cache.revision();
+        if self.watch_keys.is_some() && self.watch_rev == revision { return None; }
+        self.refresh_memo(&cache);
+        self.watch_rev = revision;
+
+        let mut keys: HashSet<String> = HashSet::new();
+        let mut slot_of: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for &slot in self.slots() {
+            if let Some(k) = cache.key_at(slot) {
+                keys.insert(k.to_string());
+                slot_of.insert(k.to_string(), slot);
+            }
+        }
+        let prev = match self.watch_keys.replace(keys) {
+            None => return None, // primed
+            Some(p) => p,
+        };
+        let now = self.watch_keys.as_ref().unwrap();
+        let mut entered: Vec<String> = now.difference(&prev).cloned().collect();
+        let mut left: Vec<String> = prev.difference(now).cloned().collect();
+        if entered.is_empty() && left.is_empty() { return None; }
+        entered.sort();
+        left.sort();
+        let rows: Vec<Json> = entered.iter().take(cap).filter_map(|k| {
+            let slot = *slot_of.get(k)?;
+            let mut r = cache.row_json(slot)?;
+            self.augment_row(&mut r, slot);
+            Some(r)
+        }).collect();
+        Some((entered, left, rows))
+    }
+}
+
+/// NaN-tolerant equality for aggregate scalars — a NaN scalar must read as
+/// "unchanged", or every refresh would trigger the full second pass.
+fn agg_value_eq(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Float(x), Value::Float(y)) => (x.is_nan() && y.is_nan()) || x == y,
+        _ => a == b,
     }
 }
 

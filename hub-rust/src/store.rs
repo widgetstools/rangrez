@@ -109,6 +109,13 @@ pub struct TableCache {
     touch_log: VecDeque<(u64, Vec<usize>)>,
     touch_log_cap: usize,
     batch_touched: Vec<usize>,
+    // Typed DATE columns (schema `type: "date" | "dateString" | "timestamp"`).
+    // The cell keeps the feed's own string for display; this side-vector holds
+    // the parsed epoch (ms, NaN = null/unparseable) so sorting and numeric
+    // range filters on the column compare instants, not text. Before this the
+    // CLIENT stamped a shadow `<col>__epoch` column into every row — the same
+    // parse, done once per write here instead of per row per consumer there.
+    date_cols: HashMap<usize, Vec<f64>>,
 }
 
 impl TableCache {
@@ -126,6 +133,7 @@ impl TableCache {
             deletions_cap: 100_000, deletions_floor: 0,
             batch_depth: 0, batch_dirty: false,
             touch_log: VecDeque::new(), touch_log_cap: 64, batch_touched: Vec::new(),
+            date_cols: HashMap::new(),
         }
     }
 
@@ -251,6 +259,10 @@ impl TableCache {
             if name == "__key" { continue; }
             if let Some(&ci) = self.index.get(name.as_str()) {
                 let v = self.intern_value(jv);
+                if let Some(epochs) = self.date_cols.get_mut(&ci) {
+                    if epochs.len() <= slot { epochs.resize(slot + 1, f64::NAN); }
+                    epochs[slot] = date_epoch_ms(&v);
+                }
                 self.cols[ci][slot] = v;
             }
         }
@@ -266,6 +278,9 @@ impl TableCache {
         let Some(slot) = self.key_to_slot.remove(key) else { return false; };
         let rk = self.keys[slot].take();
         for c in &mut self.cols { c[slot] = Value::Null; }
+        for epochs in self.date_cols.values_mut() {
+            if let Some(e) = epochs.get_mut(slot) { *e = f64::NAN; }
+        }
         self.free.push(slot);
         self.live -= 1;
         let rev = self.next_rev();
@@ -278,6 +293,21 @@ impl TableCache {
             self.deletions.drain(0..drop);
         }
         true
+    }
+
+    /// Delete every live row in ONE revision (schema, interner and slot storage
+    /// kept). Each key goes through {@link delete}, so the deletion log — and
+    /// therefore the delta stream's removals — see the truncation like any
+    /// other delete. The restart-flush primitive: before this existed nothing
+    /// could shrink a table, so a restart whose snapshot lost keys left them
+    /// rendering as current.
+    pub fn truncate(&mut self) -> usize {
+        let keys: Vec<RowKey> = self.keys.iter().flatten().cloned().collect();
+        if keys.is_empty() { return 0; }
+        self.begin_batch();
+        for k in &keys { self.delete(k.as_ref()); }
+        self.end_batch();
+        keys.len()
     }
 
     /// Revision below which the deletion log has been pruned. A subscriber whose
@@ -299,14 +329,49 @@ impl TableCache {
         for (slot, key) in self.keys.iter().enumerate() {
             if key.is_some() && self.slot_rev[slot] > since { slots.push(slot); }
         }
+        // A key deleted and then re-upserted inside the window is LIVE now and
+        // already rides the upsert list — emitting its stale removal too would
+        // have the client remove a live row (delete + upsert land in one
+        // transaction). The re-add's slot_rev is necessarily newer than the
+        // delete's revision, so "currently live" is exactly "superseded".
+        // This is what makes replace_snapshot (truncate + re-ingest) safe for
+        // the keys that survive the replace.
         let removed: Vec<String> = self.deletions.iter()
-            .filter(|(r, _)| *r > since).map(|(_, k)| k.to_string()).collect();
+            .filter(|(r, _)| *r > since)
+            .filter(|(_, k)| !self.key_to_slot.contains_key(k.as_ref()))
+            .map(|(_, k)| k.to_string()).collect();
         (slots, removed, self.rev)
     }
 
     /// The cell at a slot/column, or `&Value::Null` if out of range.
     pub fn cell(&self, slot: usize, col: usize) -> &Value {
         self.cols.get(col).and_then(|c| c.get(slot)).unwrap_or(&Value::Null)
+    }
+
+    /// Mark columns as date-typed and (re)parse any cells already written.
+    /// The registry calls this right after construction from the datasource
+    /// schema, but late marking must not strand existing rows unparsed.
+    pub fn set_date_columns<'a>(&mut self, names: impl IntoIterator<Item = &'a str>) {
+        for name in names {
+            let Some(&ci) = self.index.get(name) else { continue; };
+            let col = &self.cols[ci];
+            let epochs: Vec<f64> = col.iter().map(date_epoch_ms).collect();
+            self.date_cols.insert(ci, epochs);
+        }
+    }
+
+    pub fn is_date_col(&self, col: usize) -> bool { self.date_cols.contains_key(&col) }
+
+    /// The cell as the QUERY layer should see it: date-typed columns resolve to
+    /// their parsed epoch (Null when unparseable) so sorts and numeric range
+    /// filters compare instants; everything else is the stored cell. Display
+    /// (`row_json`) keeps the feed's own string — only comparison changes.
+    pub fn query_value(&self, slot: usize, col: usize) -> Value {
+        if let Some(epochs) = self.date_cols.get(&col) {
+            let e = epochs.get(slot).copied().unwrap_or(f64::NAN);
+            return if e.is_nan() { Value::Null } else { Value::Float(e) };
+        }
+        self.cell(slot, col).clone()
     }
 
     /// Look up a live row's cell by key and column name.
@@ -360,6 +425,17 @@ impl TableCache {
             obj.insert(name.to_string(), Json::Array(arr));
         }
         Json::Object(obj)
+    }
+}
+
+/// Epoch ms for a date-typed cell: numbers pass through as ms, strings go
+/// through the ISO parser, everything else is NaN (no instant).
+fn date_epoch_ms(v: &Value) -> f64 {
+    match v {
+        Value::Int(i) => *i as f64,
+        Value::Float(f) => *f,
+        Value::Str(s) => crate::expr::parse_iso_ms(s).map(|ms| ms as f64).unwrap_or(f64::NAN),
+        _ => f64::NAN,
     }
 }
 

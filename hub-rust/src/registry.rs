@@ -16,6 +16,23 @@ use std::sync::{Arc, Mutex};
 /// carries the schema (columns/keys) AND the opaque upstream `connection` spec
 /// the ingest layer will use to actually connect. `checksum` is what two apps'
 /// configs are reconciled on.
+/// Build a datasource's table: schema columns, with `type: "date" |
+/// "dateString" | "timestamp" | "datetime"` columns marked date-typed so the
+/// cache parses epochs at WRITE time (see `TableCache::set_date_columns`).
+fn new_table_for(ds: &Datasource) -> TableCache {
+    let mut t = TableCache::new(ds.columns.iter());
+    let date_cols: Vec<&str> = ds.config.get("columns").and_then(|c| c.as_array())
+        .map(|cols| cols.iter().filter_map(|c| {
+            let ty = c.get("type").and_then(|t| t.as_str())?;
+            if matches!(ty, "date" | "dateString" | "timestamp" | "datetime") {
+                c.get("name").or_else(|| c.get("column")).and_then(|n| n.as_str())
+            } else { None }
+        }).collect())
+        .unwrap_or_default();
+    if !date_cols.is_empty() { t.set_date_columns(date_cols); }
+    t
+}
+
 #[derive(Clone, Default)]
 pub struct Datasource {
     pub id: String,
@@ -60,6 +77,13 @@ pub struct Entry {
     pub estimated_rows: u64,
     /// Set when the last subscriber leaves — the ingestor watches it to stop.
     pub shutdown: Arc<AtomicBool>,
+    /// Data-retention pin: ingest sets it so the table outlives its viewers.
+    /// Before this, rows applied while no session was subscribed were silently
+    /// dropped (`cache_for` → None) and the cache died with its last viewer —
+    /// the "empty first block" cold start the worker's anchor session papered
+    /// over. A pinned entry is freed only by {@link Registry::unpin}
+    /// (provider stop), not by the last `release`.
+    pub pinned: bool,
 }
 
 /// What a subscribe hands back — a cloned handle to the shared cache, no borrow.
@@ -154,10 +178,11 @@ impl Registry {
             key: key.clone(),
             datasource_id: ds.id.clone(),
             schema_ref: ds.schema_ref.clone(),
-            cache: Arc::new(Mutex::new(TableCache::new(ds.columns.iter()))),
+            cache: Arc::new(Mutex::new(new_table_for(&ds))),
             subscribers: HashSet::new(),
             estimated_rows: ds.estimated_rows,
             shutdown: Arc::new(AtomicBool::new(false)),
+            pinned: false,
         });
         entry.subscribers.insert(session_id.to_string());
         Ok(Acquired {
@@ -170,15 +195,55 @@ impl Registry {
         })
     }
 
-    /// Drop a session from a key. When the last subscriber leaves, the shared
-    /// cache is released — its memory returns to the process.
+    /// Drop a session from a key. When the last subscriber leaves an UNPINNED
+    /// entry, the shared cache is released — its memory returns to the process.
+    /// A pinned entry (data has been ingested) survives its viewers and is
+    /// freed by {@link unpin}.
     pub fn release(&mut self, key: &str, session_id: &str) -> bool {
         let Some(entry) = self.entries.get_mut(key) else { return false; };
         entry.subscribers.remove(session_id);
-        if entry.subscribers.is_empty() {
+        if entry.subscribers.is_empty() && !entry.pinned {
             entry.shutdown.store(true, Ordering::Relaxed); // stop the ingestor
             self.entries.remove(key);
             true // the cache was freed
+        } else {
+            false
+        }
+    }
+
+    /// Get-or-create the entry for (datasource, params) WITHOUT a session, and
+    /// pin it so retention follows the data rather than the viewers. The ingest
+    /// path calls this: applying rows declares the table should exist.
+    pub fn ensure_pinned(&mut self, datasource_id: &str, params: &Json) -> Result<Arc<Mutex<TableCache>>, String> {
+        let ds = self.datasources.get(datasource_id)
+            .ok_or_else(|| format!("unknown datasource \"{datasource_id}\""))?
+            .clone();
+        let key = Self::cache_key(datasource_id, params);
+        let entry = self.entries.entry(key.clone()).or_insert_with(|| Entry {
+            key: key.clone(),
+            datasource_id: ds.id.clone(),
+            schema_ref: ds.schema_ref.clone(),
+            cache: Arc::new(Mutex::new(new_table_for(&ds))),
+            subscribers: HashSet::new(),
+            estimated_rows: ds.estimated_rows,
+            shutdown: Arc::new(AtomicBool::new(false)),
+            pinned: false,
+        });
+        entry.pinned = true;
+        Ok(entry.cache.clone())
+    }
+
+    /// Remove the retention pin (provider stop). Frees the entry immediately
+    /// when no session still holds it; otherwise the last `release` frees it.
+    /// Returns true when the cache was freed here.
+    pub fn unpin(&mut self, datasource_id: &str, params: &Json) -> bool {
+        let key = Self::cache_key(datasource_id, params);
+        let Some(entry) = self.entries.get_mut(&key) else { return false; };
+        entry.pinned = false;
+        if entry.subscribers.is_empty() {
+            entry.shutdown.store(true, Ordering::Relaxed);
+            self.entries.remove(&key);
+            true
         } else {
             false
         }

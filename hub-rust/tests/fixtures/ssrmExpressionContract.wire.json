@@ -1,0 +1,1297 @@
+{
+ "version": 1,
+ "generatedFrom": "ssrmExpressionContract.fixtures.json",
+ "cases": [
+  {
+   "name": "arith add",
+   "source": "[a] + [b]",
+   "compiles": true,
+   "row": {
+    "a": 2,
+    "b": 3.5
+   },
+   "expected": 5.5,
+   "wire": {
+    "k": "bin",
+    "op": "add",
+    "l": {
+     "k": "col",
+     "name": "a"
+    },
+    "r": {
+     "k": "col",
+     "name": "b"
+    }
+   }
+  },
+  {
+   "name": "arith sub mul",
+   "source": "([a] - [b]) * 2",
+   "compiles": true,
+   "row": {
+    "a": 10,
+    "b": 4
+   },
+   "expected": 12,
+   "wire": {
+    "k": "bin",
+    "op": "mul",
+    "l": {
+     "k": "bin",
+     "op": "sub",
+     "l": {
+      "k": "col",
+      "name": "a"
+     },
+     "r": {
+      "k": "col",
+      "name": "b"
+     }
+    },
+    "r": {
+     "k": "lit",
+     "v": 2
+    }
+   }
+  },
+  {
+   "name": "div",
+   "source": "[a] / [b]",
+   "compiles": true,
+   "row": {
+    "a": 9,
+    "b": 2
+   },
+   "expected": 4.5,
+   "wire": {
+    "k": "bin",
+    "op": "div",
+    "l": {
+     "k": "col",
+     "name": "a"
+    },
+    "r": {
+     "k": "col",
+     "name": "b"
+    }
+   }
+  },
+  {
+   "name": "div by zero yields null (pending-aggregate sentinel)",
+   "source": "[a] / [b]",
+   "compiles": true,
+   "row": {
+    "a": 9,
+    "b": 0
+   },
+   "expected": null,
+   "wire": {
+    "k": "bin",
+    "op": "div",
+    "l": {
+     "k": "col",
+     "name": "a"
+    },
+    "r": {
+     "k": "col",
+     "name": "b"
+    }
+   }
+  },
+  {
+   "name": "div by null yields null",
+   "source": "[a] / [b]",
+   "compiles": true,
+   "row": {
+    "a": 9,
+    "b": null
+   },
+   "expected": null,
+   "wire": {
+    "k": "bin",
+    "op": "div",
+    "l": {
+     "k": "col",
+     "name": "a"
+    },
+    "r": {
+     "k": "col",
+     "name": "b"
+    }
+   }
+  },
+  {
+   "name": "mod",
+   "source": "[a] % [b]",
+   "compiles": true,
+   "row": {
+    "a": 7,
+    "b": 4
+   },
+   "expected": 3,
+   "wire": {
+    "k": "bin",
+    "op": "mod",
+    "l": {
+     "k": "col",
+     "name": "a"
+    },
+    "r": {
+     "k": "col",
+     "name": "b"
+    }
+   }
+  },
+  {
+   "name": "plus concatenates when either side is a string",
+   "source": "[s] + [a]",
+   "compiles": true,
+   "row": {
+    "s": "px:",
+    "a": 4
+   },
+   "expected": "px:4",
+   "wire": {
+    "k": "bin",
+    "op": "add",
+    "l": {
+     "k": "col",
+     "name": "s"
+    },
+    "r": {
+     "k": "col",
+     "name": "a"
+    }
+   }
+  },
+  {
+   "name": "null in arithmetic coerces to 0 (JS semantics, not SQL null)",
+   "source": "[a] * [b]",
+   "compiles": true,
+   "row": {
+    "a": null,
+    "b": 5
+   },
+   "expected": 0,
+   "wire": {
+    "k": "bin",
+    "op": "mul",
+    "l": {
+     "k": "col",
+     "name": "a"
+    },
+    "r": {
+     "k": "col",
+     "name": "b"
+    }
+   }
+  },
+  {
+   "name": "null plus number is number",
+   "source": "[a] + [b]",
+   "compiles": true,
+   "row": {
+    "a": null,
+    "b": 5
+   },
+   "expected": 5,
+   "wire": {
+    "k": "bin",
+    "op": "add",
+    "l": {
+     "k": "col",
+     "name": "a"
+    },
+    "r": {
+     "k": "col",
+     "name": "b"
+    }
+   }
+  },
+  {
+   "name": "unary minus",
+   "source": "-[a]",
+   "compiles": true,
+   "row": {
+    "a": 3
+   },
+   "expected": -3,
+   "wire": {
+    "k": "un",
+    "op": "neg",
+    "a": {
+     "k": "col",
+     "name": "a"
+    }
+   }
+  },
+  {
+   "name": "eq is strict",
+   "source": "[a] == [b]",
+   "compiles": true,
+   "row": {
+    "a": 5,
+    "b": "5"
+   },
+   "expected": false,
+   "wire": {
+    "k": "bin",
+    "op": "eq",
+    "l": {
+     "k": "col",
+     "name": "a"
+    },
+    "r": {
+     "k": "col",
+     "name": "b"
+    }
+   }
+  },
+  {
+   "name": "ne is strict",
+   "source": "[a] != [b]",
+   "compiles": true,
+   "row": {
+    "a": 5,
+    "b": "5"
+   },
+   "expected": true,
+   "wire": {
+    "k": "bin",
+    "op": "ne",
+    "l": {
+     "k": "col",
+     "name": "a"
+    },
+    "r": {
+     "k": "col",
+     "name": "b"
+    }
+   }
+  },
+  {
+   "name": "lt",
+   "source": "[a] < [b]",
+   "compiles": true,
+   "row": {
+    "a": 2,
+    "b": 3
+   },
+   "expected": true,
+   "wire": {
+    "k": "bin",
+    "op": "lt",
+    "l": {
+     "k": "col",
+     "name": "a"
+    },
+    "r": {
+     "k": "col",
+     "name": "b"
+    }
+   }
+  },
+  {
+   "name": "le ge gt chain via and",
+   "source": "[a] <= 2 AND [b] >= 3 AND [b] > 2",
+   "compiles": true,
+   "row": {
+    "a": 2,
+    "b": 3
+   },
+   "expected": true,
+   "wire": {
+    "k": "bin",
+    "op": "and",
+    "l": {
+     "k": "bin",
+     "op": "and",
+     "l": {
+      "k": "bin",
+      "op": "le",
+      "l": {
+       "k": "col",
+       "name": "a"
+      },
+      "r": {
+       "k": "lit",
+       "v": 2
+      }
+     },
+     "r": {
+      "k": "bin",
+      "op": "ge",
+      "l": {
+       "k": "col",
+       "name": "b"
+      },
+      "r": {
+       "k": "lit",
+       "v": 3
+      }
+     }
+    },
+    "r": {
+     "k": "bin",
+     "op": "gt",
+     "l": {
+      "k": "col",
+      "name": "b"
+     },
+     "r": {
+      "k": "lit",
+      "v": 2
+     }
+    }
+   }
+  },
+  {
+   "name": "and returns the deciding operand, not a boolean",
+   "source": "[a] AND [b]",
+   "compiles": true,
+   "row": {
+    "a": 0,
+    "b": 7
+   },
+   "expected": 0,
+   "wire": {
+    "k": "bin",
+    "op": "and",
+    "l": {
+     "k": "col",
+     "name": "a"
+    },
+    "r": {
+     "k": "col",
+     "name": "b"
+    }
+   }
+  },
+  {
+   "name": "or returns the first truthy operand",
+   "source": "[a] OR [b]",
+   "compiles": true,
+   "row": {
+    "a": 0,
+    "b": 7
+   },
+   "expected": 7,
+   "wire": {
+    "k": "bin",
+    "op": "or",
+    "l": {
+     "k": "col",
+     "name": "a"
+    },
+    "r": {
+     "k": "col",
+     "name": "b"
+    }
+   }
+  },
+  {
+   "name": "not",
+   "source": "NOT ([a] > 5)",
+   "compiles": true,
+   "row": {
+    "a": 3
+   },
+   "expected": true,
+   "wire": {
+    "k": "un",
+    "op": "not",
+    "a": {
+     "k": "bin",
+     "op": "gt",
+     "l": {
+      "k": "col",
+      "name": "a"
+     },
+     "r": {
+      "k": "lit",
+      "v": 5
+     }
+    }
+   }
+  },
+  {
+   "name": "ternary uses isTruthy (empty string is falsy)",
+   "source": "[s] ? 1 : 2",
+   "compiles": true,
+   "row": {
+    "s": ""
+   },
+   "expected": 2,
+   "wire": {
+    "k": "cond",
+    "branches": [
+     {
+      "when": {
+       "k": "col",
+       "name": "s"
+      },
+      "then": {
+       "k": "lit",
+       "v": 1
+      }
+     }
+    ],
+    "else": {
+     "k": "lit",
+     "v": 2
+    }
+   }
+  },
+  {
+   "name": "in is strict includes",
+   "source": "[a] IN [1, 2, 3]",
+   "compiles": true,
+   "row": {
+    "a": "2"
+   },
+   "expected": false,
+   "wire": {
+    "k": "in",
+    "a": {
+     "k": "col",
+     "name": "a"
+    },
+    "list": [
+     {
+      "k": "lit",
+      "v": 1
+     },
+     {
+      "k": "lit",
+      "v": 2
+     },
+     {
+      "k": "lit",
+      "v": 3
+     }
+    ]
+   }
+  },
+  {
+   "name": "in hit",
+   "source": "[s] IN ['AA', 'BB']",
+   "compiles": true,
+   "row": {
+    "s": "BB"
+   },
+   "expected": true,
+   "wire": {
+    "k": "in",
+    "a": {
+     "k": "col",
+     "name": "s"
+    },
+    "list": [
+     {
+      "k": "lit",
+      "v": "AA"
+     },
+     {
+      "k": "lit",
+      "v": "BB"
+     }
+    ]
+   }
+  },
+  {
+   "name": "between inclusive",
+   "source": "[a] BETWEEN 2 AND 4",
+   "compiles": true,
+   "row": {
+    "a": 4
+   },
+   "expected": true,
+   "wire": {
+    "k": "between",
+    "a": {
+     "k": "col",
+     "name": "a"
+    },
+    "lo": {
+     "k": "lit",
+     "v": 2
+    },
+    "hi": {
+     "k": "lit",
+     "v": 4
+    }
+   }
+  },
+  {
+   "name": "between miss",
+   "source": "[a] BETWEEN 2 AND 4",
+   "compiles": true,
+   "row": {
+    "a": 4.01
+   },
+   "expected": false,
+   "wire": {
+    "k": "between",
+    "a": {
+     "k": "col",
+     "name": "a"
+    },
+    "lo": {
+     "k": "lit",
+     "v": 2
+    },
+    "hi": {
+     "k": "lit",
+     "v": 4
+    }
+   }
+  },
+  {
+   "name": "abs round",
+   "source": "ROUND(ABS([a]), 1)",
+   "compiles": true,
+   "row": {
+    "a": -2.347
+   },
+   "expected": 2.3,
+   "wire": {
+    "k": "fn",
+    "name": "ROUND",
+    "args": [
+     {
+      "k": "fn",
+      "name": "ABS",
+      "args": [
+       {
+        "k": "col",
+        "name": "a"
+       }
+      ]
+     },
+     {
+      "k": "lit",
+      "v": 1
+     }
+    ]
+   }
+  },
+  {
+   "name": "floor ceil",
+   "source": "FLOOR([a]) + CEIL([a])",
+   "compiles": true,
+   "row": {
+    "a": 2.5
+   },
+   "expected": 5,
+   "wire": {
+    "k": "bin",
+    "op": "add",
+    "l": {
+     "k": "fn",
+     "name": "FLOOR",
+     "args": [
+      {
+       "k": "col",
+       "name": "a"
+      }
+     ]
+    },
+    "r": {
+     "k": "fn",
+     "name": "CEIL",
+     "args": [
+      {
+       "k": "col",
+       "name": "a"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "name": "sqrt pow",
+   "source": "SQRT(POW([a], 2))",
+   "compiles": true,
+   "row": {
+    "a": 7
+   },
+   "expected": 7,
+   "wire": {
+    "k": "fn",
+    "name": "SQRT",
+    "args": [
+     {
+      "k": "fn",
+      "name": "POW",
+      "args": [
+       {
+        "k": "col",
+        "name": "a"
+       },
+       {
+        "k": "lit",
+        "v": 2
+       }
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "mod fn",
+   "source": "MOD([a], 4)",
+   "compiles": true,
+   "row": {
+    "a": 7
+   },
+   "expected": 3,
+   "wire": {
+    "k": "fn",
+    "name": "MOD",
+    "args": [
+     {
+      "k": "col",
+      "name": "a"
+     },
+     {
+      "k": "lit",
+      "v": 4
+     }
+    ]
+   }
+  },
+  {
+   "name": "log exp roundtrip",
+   "source": "ROUND(LOG(EXP([a])), 6)",
+   "compiles": true,
+   "row": {
+    "a": 2
+   },
+   "expected": 2,
+   "wire": {
+    "k": "fn",
+    "name": "ROUND",
+    "args": [
+     {
+      "k": "fn",
+      "name": "LOG",
+      "args": [
+       {
+        "k": "fn",
+        "name": "EXP",
+        "args": [
+         {
+          "k": "col",
+          "name": "a"
+         }
+        ]
+       }
+      ]
+     },
+     {
+      "k": "lit",
+      "v": 6
+     }
+    ]
+   }
+  },
+  {
+   "name": "scalar min max (multi-arg form stays scalar)",
+   "source": "MIN([a], [b]) + MAX([a], [b])",
+   "compiles": true,
+   "row": {
+    "a": 2,
+    "b": 9
+   },
+   "expected": 11,
+   "wire": {
+    "k": "bin",
+    "op": "add",
+    "l": {
+     "k": "fn",
+     "name": "MIN",
+     "args": [
+      {
+       "k": "col",
+       "name": "a"
+      },
+      {
+       "k": "col",
+       "name": "b"
+      }
+     ]
+    },
+    "r": {
+     "k": "fn",
+     "name": "MAX",
+     "args": [
+      {
+       "k": "col",
+       "name": "a"
+      },
+      {
+       "k": "col",
+       "name": "b"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "name": "concat coerces null to empty string",
+   "source": "CONCAT([s], '-', [t])",
+   "compiles": true,
+   "row": {
+    "s": "AB",
+    "t": null
+   },
+   "expected": "AB-",
+   "wire": {
+    "k": "fn",
+    "name": "CONCAT",
+    "args": [
+     {
+      "k": "col",
+      "name": "s"
+     },
+     {
+      "k": "lit",
+      "v": "-"
+     },
+     {
+      "k": "col",
+      "name": "t"
+     }
+    ]
+   }
+  },
+  {
+   "name": "upper lower trim",
+   "source": "UPPER([s]) + LOWER([t]) + TRIM([u])",
+   "compiles": true,
+   "row": {
+    "s": "ab",
+    "t": "CD",
+    "u": "  x  "
+   },
+   "expected": "ABcdx",
+   "wire": {
+    "k": "bin",
+    "op": "add",
+    "l": {
+     "k": "bin",
+     "op": "add",
+     "l": {
+      "k": "fn",
+      "name": "UPPER",
+      "args": [
+       {
+        "k": "col",
+        "name": "s"
+       }
+      ]
+     },
+     "r": {
+      "k": "fn",
+      "name": "LOWER",
+      "args": [
+       {
+        "k": "col",
+        "name": "t"
+       }
+      ]
+     }
+    },
+    "r": {
+     "k": "fn",
+     "name": "TRIM",
+     "args": [
+      {
+       "k": "col",
+       "name": "u"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "name": "len of null is 0",
+   "source": "LEN([s])",
+   "compiles": true,
+   "row": {
+    "s": null
+   },
+   "expected": 0,
+   "wire": {
+    "k": "fn",
+    "name": "LEN",
+    "args": [
+     {
+      "k": "col",
+      "name": "s"
+     }
+    ]
+   }
+  },
+  {
+   "name": "substring is (start, length)",
+   "source": "SUBSTRING([s], 1, 3)",
+   "compiles": true,
+   "row": {
+    "s": "abcdef"
+   },
+   "expected": "bcd",
+   "wire": {
+    "k": "fn",
+    "name": "SUBSTRING",
+    "args": [
+     {
+      "k": "col",
+      "name": "s"
+     },
+     {
+      "k": "lit",
+      "v": 1
+     },
+     {
+      "k": "lit",
+      "v": 3
+     }
+    ]
+   }
+  },
+  {
+   "name": "replace",
+   "source": "REPLACE([s], 'b', 'x')",
+   "compiles": true,
+   "row": {
+    "s": "abcb"
+   },
+   "expected": "axcx",
+   "wire": {
+    "k": "fn",
+    "name": "REPLACE",
+    "args": [
+     {
+      "k": "col",
+      "name": "s"
+     },
+     {
+      "k": "lit",
+      "v": "b"
+     },
+     {
+      "k": "lit",
+      "v": "x"
+     }
+    ]
+   }
+  },
+  {
+   "name": "contains starts ends",
+   "source": "CONTAINS([s], 'ov') AND STARTS_WITH([s], 'G') AND ENDS_WITH([s], 's')",
+   "compiles": true,
+   "row": {
+    "s": "Govies"
+   },
+   "expected": true,
+   "wire": {
+    "k": "bin",
+    "op": "and",
+    "l": {
+     "k": "bin",
+     "op": "and",
+     "l": {
+      "k": "fn",
+      "name": "CONTAINS",
+      "args": [
+       {
+        "k": "col",
+        "name": "s"
+       },
+       {
+        "k": "lit",
+        "v": "ov"
+       }
+      ]
+     },
+     "r": {
+      "k": "fn",
+      "name": "STARTS_WITH",
+      "args": [
+       {
+        "k": "col",
+        "name": "s"
+       },
+       {
+        "k": "lit",
+        "v": "G"
+       }
+      ]
+     }
+    },
+    "r": {
+     "k": "fn",
+     "name": "ENDS_WITH",
+     "args": [
+      {
+       "k": "col",
+       "name": "s"
+      },
+      {
+       "k": "lit",
+       "v": "s"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "name": "if",
+   "source": "IF([a] > 0, 'up', 'down')",
+   "compiles": true,
+   "row": {
+    "a": 1
+   },
+   "expected": "up",
+   "wire": {
+    "k": "fn",
+    "name": "IF",
+    "args": [
+     {
+      "k": "bin",
+      "op": "gt",
+      "l": {
+       "k": "col",
+       "name": "a"
+      },
+      "r": {
+       "k": "lit",
+       "v": 0
+      }
+     },
+     {
+      "k": "lit",
+      "v": "up"
+     },
+     {
+      "k": "lit",
+      "v": "down"
+     }
+    ]
+   }
+  },
+  {
+   "name": "ifs first match wins",
+   "source": "IFS([a] > 10, 'big', [a] > 5, 'mid', true, 'small')",
+   "compiles": true,
+   "row": {
+    "a": 7
+   },
+   "expected": "mid",
+   "wire": {
+    "k": "fn",
+    "name": "IFS",
+    "args": [
+     {
+      "k": "bin",
+      "op": "gt",
+      "l": {
+       "k": "col",
+       "name": "a"
+      },
+      "r": {
+       "k": "lit",
+       "v": 10
+      }
+     },
+     {
+      "k": "lit",
+      "v": "big"
+     },
+     {
+      "k": "bin",
+      "op": "gt",
+      "l": {
+       "k": "col",
+       "name": "a"
+      },
+      "r": {
+       "k": "lit",
+       "v": 5
+      }
+     },
+     {
+      "k": "lit",
+      "v": "mid"
+     },
+     {
+      "k": "lit",
+      "v": true
+     },
+     {
+      "k": "lit",
+      "v": "small"
+     }
+    ]
+   }
+  },
+  {
+   "name": "isnull is a fallback (v, default), not a predicate",
+   "source": "ISNULL([s], 'dash')",
+   "compiles": true,
+   "row": {
+    "s": null
+   },
+   "expected": "dash",
+   "wire": {
+    "k": "fn",
+    "name": "ISNULL",
+    "args": [
+     {
+      "k": "col",
+      "name": "s"
+     },
+     {
+      "k": "lit",
+      "v": "dash"
+     }
+    ]
+   }
+  },
+  {
+   "name": "isnotnull and isempty are predicates",
+   "source": "IF(ISNOTNULL([s]) AND ISEMPTY([t]), 'e', 'v')",
+   "compiles": true,
+   "row": {
+    "s": 1,
+    "t": ""
+   },
+   "expected": "e",
+   "wire": {
+    "k": "fn",
+    "name": "IF",
+    "args": [
+     {
+      "k": "bin",
+      "op": "and",
+      "l": {
+       "k": "fn",
+       "name": "ISNOTNULL",
+       "args": [
+        {
+         "k": "col",
+         "name": "s"
+        }
+       ]
+      },
+      "r": {
+       "k": "fn",
+       "name": "ISEMPTY",
+       "args": [
+        {
+         "k": "col",
+         "name": "t"
+        }
+       ]
+      }
+     },
+     {
+      "k": "lit",
+      "v": "e"
+     },
+     {
+      "k": "lit",
+      "v": "v"
+     }
+    ]
+   }
+  },
+  {
+   "name": "nested conditional over arithmetic",
+   "source": "IF([pnl] / [mv] > 0.1, 'hot', 'cold')",
+   "compiles": true,
+   "row": {
+    "pnl": 30,
+    "mv": 200
+   },
+   "expected": "hot",
+   "wire": {
+    "k": "fn",
+    "name": "IF",
+    "args": [
+     {
+      "k": "bin",
+      "op": "gt",
+      "l": {
+       "k": "bin",
+       "op": "div",
+       "l": {
+        "k": "col",
+        "name": "pnl"
+       },
+       "r": {
+        "k": "col",
+        "name": "mv"
+       }
+      },
+      "r": {
+       "k": "lit",
+       "v": 0.1
+      }
+     },
+     {
+      "k": "lit",
+      "v": "hot"
+     },
+     {
+      "k": "lit",
+      "v": "cold"
+     }
+    ]
+   }
+  },
+  {
+   "name": "agg form compiles with requires aggregates",
+   "source": "[mv] / SUM([mv])",
+   "compiles": true,
+   "row": {
+    "mv": 25
+   },
+   "allRows": [
+    {
+     "mv": 25
+    },
+    {
+     "mv": 75
+    }
+   ],
+   "expected": 0.25,
+   "requires": [
+    "aggregates"
+   ],
+   "wire": {
+    "k": "bin",
+    "op": "div",
+    "l": {
+     "k": "col",
+     "name": "mv"
+    },
+    "r": {
+     "k": "agg",
+     "fn": "sum",
+     "col": "mv"
+    }
+   }
+  },
+  {
+   "name": "avg over column",
+   "source": "AVG([px])",
+   "compiles": true,
+   "row": {
+    "px": 1
+   },
+   "allRows": [
+    {
+     "px": 2
+    },
+    {
+     "px": 4
+    }
+   ],
+   "expected": 3,
+   "requires": [
+    "aggregates"
+   ],
+   "wire": {
+    "k": "agg",
+    "fn": "avg",
+    "col": "px"
+   }
+  },
+  {
+   "name": "date part requires typed dates",
+   "source": "YEAR([d])",
+   "compiles": true,
+   "row": {
+    "d": "2031-06-30"
+   },
+   "expected": 2031,
+   "requires": [
+    "dateFns"
+   ],
+   "wire": {
+    "k": "fn",
+    "name": "YEAR",
+    "args": [
+     {
+      "k": "col",
+      "name": "d"
+     }
+    ]
+   }
+  },
+  {
+   "name": "median is loaded-rows-only — refused",
+   "source": "MEDIAN([px])",
+   "compiles": false,
+   "row": {
+    "px": 1
+   },
+   "allRows": [
+    {
+     "px": 1
+    },
+    {
+     "px": 2
+    },
+    {
+     "px": 9
+    }
+   ],
+   "expected": 2
+  },
+  {
+   "name": "stdev refused",
+   "source": "STDEV([px]) > 1",
+   "compiles": false,
+   "row": {
+    "px": 1
+   },
+   "allRows": [
+    {
+     "px": 1
+    },
+    {
+     "px": 5
+    }
+   ],
+   "expected": true
+  },
+  {
+   "name": "regex refused",
+   "source": "REGEX_MATCH([s], '^G')",
+   "compiles": false,
+   "row": {
+    "s": "Govies"
+   },
+   "expected": true
+  },
+  {
+   "name": "now refused (non-deterministic)",
+   "source": "YEAR(NOW())",
+   "compiles": false
+  },
+  {
+   "name": "date_diff refused (unit-laden)",
+   "source": "DATE_DIFF([d], TODAY(), 'days')",
+   "compiles": false
+  },
+  {
+   "name": "variable refused",
+   "source": "value * 2",
+   "compiles": false,
+   "row": {}
+  }
+ ]
+}

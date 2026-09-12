@@ -18,6 +18,7 @@ pub mod dsl;
 pub mod alerts;
 pub mod view;
 pub mod delta;
+pub mod expr;
 pub mod groupwatch;
 pub mod flow;
 // Native ingest transports (STOMP/socket.io/REST over real sockets) — the wasm

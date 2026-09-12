@@ -46,9 +46,15 @@ impl Hub {
     pub fn open_view(&mut self, datasource_id: &str, params: &Json, spec: &Json) -> Result<String, String> {
         let cache = self.registry.cache_for(datasource_id, params)
             .ok_or_else(|| format!("no subscription for \"{datasource_id}\""))?;
+        let parsed = crate::view::ViewSpec::from_json(spec);
+        if !parsed.computed_errors.is_empty() {
+            // A view whose computed columns half-parsed would filter on a
+            // different predicate than it displays — reject, never degrade.
+            return Err(format!("invalid computed columns: {}", parsed.computed_errors.join("; ")));
+        }
         self.view_seq += 1;
         let view_id = format!("v{}", self.view_seq);
-        let view = crate::view::View::new(cache, crate::view::ViewSpec::from_json(spec), String::new());
+        let view = crate::view::View::new(cache, parsed, String::new());
         self.views.insert(view_id.clone(), view);
         Ok(view_id)
     }
