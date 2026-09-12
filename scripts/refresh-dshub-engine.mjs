@@ -27,13 +27,14 @@
  */
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { copyFileSync, readFileSync, writeFileSync, existsSync, readdirSync, unlinkSync } from 'node:fs';
+import { copyFileSync, readFileSync, writeFileSync, existsSync, readdirSync, unlinkSync, mkdirSync, rmSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const PKG = join(ROOT, 'hub-rust', 'pkg');
 const DIST = join(ROOT, 'dist-pkg', 'dshub-hub');
+const PLANE_SRC = join(ROOT, 'packages', 'dshub-plane', 'src');
 /** The engine pair: glue + binary, always taken together. */
 const ENGINE = ['dshub.js', 'dshub_bg.wasm'];
 
@@ -66,6 +67,23 @@ const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
 const before = ENGINE.map((f) => sha256(join(DIST, 'runtime', f)));
 
 for (const f of ENGINE) copyFileSync(join(PKG, f), join(DIST, 'runtime', f));
+
+// The plane ships as TypeScript SOURCE, not compiled output. Consumers of
+// this tarball are TS repos that already build from source (canvasgrid's own
+// packages resolve to `./src/index.ts`), and shipping source keeps the plane
+// traceable the way `lib/` is not: every file below is tracked, so the
+// commit stamped in PROVENANCE.json describes it exactly.
+//
+// Tests and the vitest stub stay behind — they belong to the package, not to
+// what a consumer links against.
+const planeDir = join(DIST, 'plane');
+rmSync(planeDir, { recursive: true, force: true });
+mkdirSync(planeDir, { recursive: true });
+const planeFiles = readdirSync(PLANE_SRC)
+  .filter((f) => (f.endsWith('.ts')) && !f.endsWith('.test.ts') && f !== 'dshub.vitest-stub.ts')
+  .sort();
+for (const f of planeFiles) copyFileSync(join(PLANE_SRC, f), join(planeDir, f));
+const planeCommit = git('log', '-1', '--format=%H', '--', 'packages/dshub-plane/src');
 const after = ENGINE.map((f) => sha256(join(DIST, 'runtime', f)));
 const changed = ENGINE.some((_, i) => before[i] !== after[i]);
 
@@ -83,10 +101,17 @@ if (versionArg !== -1) {
 // the consumer's copy has to carry its own provenance -- and `files` decides
 // what npm packs, so a provenance record left out of it would exist only on
 // the machine that built it.
-if (!manifest.files.includes('PROVENANCE.json')) {
-  manifest.files = [...manifest.files, 'PROVENANCE.json'];
-  writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + '\n');
+let manifestDirty = false;
+for (const entry of ['PROVENANCE.json', 'plane']) {
+  if (!manifest.files.includes(entry)) { manifest.files = [...manifest.files, entry]; manifestDirty = true; }
 }
+// Subpath export so a consumer can take the plane WITHOUT the barrel, which
+// pulls React through useSsrm/useCsrm even though React is an optional peer.
+if (manifest.exports['./plane'] !== './plane/index.ts') {
+  manifest.exports = { ...manifest.exports, './plane': './plane/index.ts' };
+  manifestDirty = true;
+}
+if (manifestDirty) writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + '\n');
 writeFileSync(join(DIST, 'PROVENANCE.json'), JSON.stringify({
   package: `${manifest.name}@${manifest.version}`,
   // Deliberately no build timestamp. The consumer pins this tarball by
@@ -99,6 +124,12 @@ writeFileSync(join(DIST, 'PROVENANCE.json'), JSON.stringify({
     source: 'hub-rust/pkg',
     commit: engineCommit,
     files: Object.fromEntries(ENGINE.map((f, i) => [f, after[i]])),
+  },
+  plane: {
+    source: 'packages/dshub-plane/src',
+    commit: planeCommit,
+    traceable: true,
+    files: planeFiles,
   },
   lib: {
     traceable: false,
@@ -114,4 +145,5 @@ const tgz = readdirSync(DIST).find((f) => f.endsWith('.tgz'));
 console.log(`\nengine  ${changed ? 'REFRESHED' : 'already current'} from ${engineCommit.slice(0, 8)}`);
 for (const [i, f] of ENGINE.entries()) console.log(`  ${f.padEnd(16)} ${after[i].slice(0, 16)}`);
 console.log(`tarball ${tgz}  sha256 ${sha256(join(DIST, tgz)).slice(0, 16)}`);
+console.log(`plane   ${planeFiles.length} files from ${planeCommit.slice(0, 8)}`);
 console.log('lib/    NOT refreshed -- see PROVENANCE.json');
