@@ -1232,9 +1232,9 @@
    }
   },
   {
-   "name": "median is loaded-rows-only — refused",
+   "name": "median aggregate compiles with requires aggregates",
    "source": "MEDIAN([px])",
-   "compiles": false,
+   "compiles": true,
    "row": {
     "px": 1
    },
@@ -1249,12 +1249,20 @@
      "px": 9
     }
    ],
-   "expected": 2
+   "expected": 2,
+   "requires": [
+    "aggregates"
+   ],
+   "wire": {
+    "k": "agg",
+    "fn": "median",
+    "col": "px"
+   }
   },
   {
-   "name": "stdev refused",
+   "name": "stdev aggregate compiles with requires aggregates",
    "source": "STDEV([px]) > 1",
-   "compiles": false,
+   "compiles": true,
    "row": {
     "px": 1
    },
@@ -1266,7 +1274,23 @@
      "px": 5
     }
    ],
-   "expected": true
+   "expected": true,
+   "requires": [
+    "aggregates"
+   ],
+   "wire": {
+    "k": "bin",
+    "op": "gt",
+    "l": {
+     "k": "agg",
+     "fn": "stdev",
+     "col": "px"
+    },
+    "r": {
+     "k": "lit",
+     "v": 1
+    }
+   }
   },
   {
    "name": "regex refused",
