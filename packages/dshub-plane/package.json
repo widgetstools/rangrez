@@ -1,0 +1,21 @@
+{
+  "name": "@wellsfargo-starui/dshub-plane",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "SSRM plane over the hub-rust wasm engine: view lifecycle, windows, group watches, ticks. No dependencies \u2014 the provider config is consumed structurally.",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "build": "tsc --noEmit",
+    "lint": "echo \"no lint yet\"",
+    "test": "vitest run",
+    "clean": "rm -rf dist"
+  },
+  "devDependencies": {
+    "vitest": "^2.1.9"
+  }
+}
