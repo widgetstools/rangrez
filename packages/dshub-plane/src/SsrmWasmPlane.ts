@@ -122,6 +122,10 @@ interface SsrmReadWindow {
   pivotResultFields?: string[];
 }
 
+/** Engine message types that are PUSHES, not replies — the set
+ *  `pollAllTicks` knows how to translate. */
+const PUSH_TYPES = new Set(['groupDelta', 'viewDelta', 'rowDelta']);
+
 export interface SsrmControlReply {
   id?: string;
   type?: string;
@@ -276,6 +280,25 @@ export class SsrmWasmPlane {
    */
   private readonly watchViews = new Map<string, { sessionId: string; providerId: string; ruleId: string }>();
   /** Parsed engine `capabilities()` — memoized once the hub exists. */
+  /**
+   * Engine pushes that arrived on a CONTROL reply rather than on a tick.
+   *
+   * `on_control` returns "the reply, followed by that session's queued
+   * outbox", and some engine pushes only ever come that way. `watchGroups` is
+   * the one that bites: the engine emits a full group snapshot the instant a
+   * watch is registered (`groupwatch.rs`: `if let Some(m) = w.poll() {
+   * session.push(m) }`) and then, having recorded that as its baseline,
+   * reports nothing on the next tick because nothing has changed. Reading
+   * only the matching reply therefore lost the whole tree whenever a watch
+   * was registered over an already-populated table — and "the tree as it
+   * stands now" is precisely what a skeleton-style consumer asks for.
+   *
+   * Buffered here, drained by `pollAllTicks` through the same translation as
+   * a real tick, so a consumer sees one uniform stream and cannot tell which
+   * transport a push took.
+   */
+  private readonly pendingPushes: Array<{ sessionId: string; message: unknown }> = [];
+
   private capsMemo: Record<string, unknown> | null | undefined;
   private nextCtl = 1;
 
@@ -776,6 +799,18 @@ export class SsrmWasmPlane {
       else out.set(providerId, [tick]);
     };
     const perSession = parseJson<Array<{ sessionId: string; messages?: unknown[] }>>(hub.tick(), []);
+    // Control-reply pushes first, so a watch's initial snapshot precedes any
+    // change that landed after it.
+    if (this.pendingPushes.length > 0) {
+      const buffered = this.pendingPushes.splice(0, this.pendingPushes.length);
+      const bySession = new Map<string, unknown[]>();
+      for (const { sessionId, message } of buffered) {
+        const bucket = bySession.get(sessionId);
+        if (bucket) bucket.push(message);
+        else bySession.set(sessionId, [message]);
+      }
+      for (const [sessionId, messages] of bySession) perSession.unshift({ sessionId, messages });
+    }
     for (const rec of perSession) {
       const providerId = this.sessionProvider.get(rec.sessionId);
       // A session only produces deltas after `subscribe`, which records it
@@ -969,7 +1004,17 @@ export class SsrmWasmPlane {
   }
 
   private control(hub: RustHubLike, sessionId: string, msg: Record<string, unknown>): SsrmControlReply[] {
-    return parseJson<SsrmControlReply[]>(hub.on_control(sessionId, JSON.stringify(msg)), []);
+    const replies = parseJson<SsrmControlReply[]>(hub.on_control(sessionId, JSON.stringify(msg)), []);
+    // Keep the outbox pushes that rode along for `pollAllTicks` — see
+    // `pendingPushes`. Selected by message TYPE, not by the absence of an
+    // `id`: a groupDelta carries one too (`groupwatch.rs` stamps
+    // `"g-<datasourceId>"`), so an id-based test silently keeps nothing.
+    for (const r of replies) {
+      if (r.type !== undefined && PUSH_TYPES.has(r.type)) {
+        this.pendingPushes.push({ sessionId, message: r });
+      }
+    }
+    return replies;
   }
 
   private ctlId(): string {

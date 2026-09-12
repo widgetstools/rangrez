@@ -282,3 +282,43 @@ describe('SsrmWasmPlane × the in-repo engine', () => {
     expect(page.unsupportedFilters).toBeUndefined();
   });
 });
+
+describe('watchGroups over an already-populated table', () => {
+  it('delivers the engine\u2019s initial group snapshot', async () => {
+    // The engine emits a full group snapshot the moment a watch registers,
+    // into the session OUTBOX — which `on_control` returns alongside the
+    // reply — and then reports nothing on the next tick, because it has
+    // already recorded that snapshot as its baseline. Reading only the
+    // matching reply lost the entire tree for any watch registered over data
+    // that already existed, which is the normal case for a grid that groups
+    // an open blotter.
+    const plane = new SsrmWasmPlane(realHub);
+    await plane.boot('wg', cfg);
+    await plane.attachSession('wgs');
+    await plane.ingest('wg', ROWS, false);
+    plane.pollAllTicks(); // drain the ingest delta so only the watch is left
+
+    await plane.watchGroups('wgs', 'wg', { groupBy: ['desk'], aggregates: { mv: 'sum' } });
+
+    const ticks = plane.pollAllTicks().get('wg') ?? [];
+    const groups = ticks.filter((t) => t.kind === 'groupDelta').flatMap((t) => t.groups ?? []);
+    const byValue = new Map(groups.map((g) => [String((g as { values?: unknown[] }).values?.[0]), g]));
+    expect([...byValue.keys()].sort()).toEqual(['Credit', 'Rates']);
+    expect(byValue.get('Rates')).toMatchObject({ count: 2, aggregates: { mv: 30 } });
+    expect(byValue.get('Credit')).toMatchObject({ count: 2, aggregates: { mv: 70 } });
+  });
+
+  it('and does not repeat it on a later quiet tick', async () => {
+    // Delivered once, not re-pushed: the buffer is drained, and the engine's
+    // own diff has nothing to add until something moves.
+    const plane = new SsrmWasmPlane(realHub);
+    await plane.boot('wg2', cfg);
+    await plane.attachSession('wg2s');
+    await plane.ingest('wg2', ROWS, false);
+    plane.pollAllTicks();
+    await plane.watchGroups('wg2s', 'wg2', { groupBy: ['desk'], aggregates: { mv: 'sum' } });
+    expect((plane.pollAllTicks().get('wg2') ?? []).filter((t) => t.kind === 'groupDelta')).toHaveLength(1);
+    expect((plane.pollAllTicks().get('wg2') ?? []).filter((t) => t.kind === 'groupDelta')).toHaveLength(0);
+  });
+});
+
