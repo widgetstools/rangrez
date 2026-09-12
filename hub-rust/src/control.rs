@@ -166,6 +166,20 @@ pub fn handle_control(hub: &mut Hub, session: &mut Session, msg: &Json) -> Optio
             let mut w = crate::groupwatch::GroupWatch::new(ds.clone(), cache, filter, group_by, aggs, cms);
             if let Some(m) = w.poll() { session.push(m); } // initial group snapshot
             let count = w.group_count();
+            // REPLACE this session's watch on this datasource, do not stack a
+            // second one beside it.
+            //
+            // A grid re-watches whenever its grouping changes, and each watch
+            // scans the whole table per level on every tick. Appending meant a
+            // session that had grouped four different ways paid four scans a
+            // tick forever, and a consumer folding the pushes got the four
+            // trees mixed together — depth-4 paths arriving for a one-level
+            // grouping. There is no `unwatchGroups` verb to undo it with, so
+            // the only way out was to drop the whole session.
+            //
+            // One watch per (session, datasource) is what a viewer can
+            // actually mean: a session has one grouping at a time.
+            session.group_watches.retain(|existing| existing.datasource_id != ds);
             session.group_watches.push(w);
             Some(json!({ "id": id, "type": "result", "payload": { "watching": true, "groupCount": count } }))
         }
