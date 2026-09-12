@@ -107,9 +107,14 @@ for (const entry of ['PROVENANCE.json', 'plane']) {
 }
 // Subpath export so a consumer can take the plane WITHOUT the barrel, which
 // pulls React through useSsrm/useCsrm even though React is an optional peer.
-if (manifest.exports['./plane'] !== './plane/index.ts') {
-  manifest.exports = { ...manifest.exports, './plane': './plane/index.ts' };
-  manifestDirty = true;
+// `./plane` is the page-safe barrel. `./plane/*` is for consumers that
+// inject their own `RustHubFactory` and therefore need `SsrmWasmPlane`
+// itself, which the barrel withholds on purpose: its module body carries a
+// literal `import('@starui/dshub')` that a page bundle cannot resolve. An
+// injected factory never reaches that import, but the specifier still has to
+// resolve at BUILD time, so such a consumer also needs an alias for it.
+for (const [k, v] of [['./plane', './plane/index.ts'], ['./plane/*', './plane/*']]) {
+  if (manifest.exports[k] !== v) { manifest.exports = { ...manifest.exports, [k]: v }; manifestDirty = true; }
 }
 if (manifestDirty) writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + '\n');
 writeFileSync(join(DIST, 'PROVENANCE.json'), JSON.stringify({
