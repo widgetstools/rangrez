@@ -286,3 +286,112 @@ fn a_hot_reload_reports_the_config_it_could_not_parse() {
     assert!(out.iter().any(|d| d["id"] == "positions" && d.get("reload").is_some()));
 }
 
+// ───────────────────── the filter layer, same class ───────────────────────
+//
+// A leaf whose column does not resolve reads Null, and what happens next is
+// decided by the operator: `equals` matches nothing, `notEqual` and
+// `notContains` match everything. Measured on the shipped engine before this —
+// 0 rows and 2 rows of 2 for the same bad column, neither an error. A saved
+// view naming a since-renamed column hits exactly this, and the half that
+// matters is the one where the blotter looks filtered and is not.
+
+fn open_view(ep: &mut Endpoint, hub: &mut Hub, view: Json) -> Json {
+    ask(ep, hub, json!({"id":"v","type":"openView",
+        "ref":{"datasourceId":"positions","params":{}}, "view": view}))
+}
+
+#[test]
+fn a_filter_on_an_unknown_column_is_refused_not_guessed() {
+    let (mut hub, mut ep) = ready();
+    let r = open_view(&mut ep, &mut hub, json!({
+        "filter":[{"column":"trader","op":"equals","value":"ann"}]}));
+    assert_eq!(r["type"], "error", "{r}");
+    assert!(r["message"].as_str().unwrap().contains("trader"), "{r}");
+}
+
+#[test]
+fn the_negated_operators_are_refused_too() {
+    // The dangerous half: these used to match EVERYTHING, so the filter
+    // silently did nothing and the grid looked unfiltered-but-correct.
+    let (mut hub, mut ep) = ready();
+    for op in ["notEqual", "notContains", "notBlank"] {
+        let r = open_view(&mut ep, &mut hub, json!({
+            "filter":[{"column":"trader","op":op,"value":"ann"}]}));
+        assert_eq!(r["type"], "error", "op {op}: {r}");
+    }
+}
+
+#[test]
+fn a_bad_column_inside_an_or_branch_is_caught() {
+    // OR branches hold their own leaves; walking only the top level would miss
+    // this and the branch would quietly contribute nothing.
+    let (mut hub, mut ep) = ready();
+    let r = open_view(&mut ep, &mut hub, json!({"filter":[
+        {"op":"or","conditions":[
+            {"column":"desk","op":"equals","value":"Govies"},
+            {"column":"trader","op":"equals","value":"ann"}]}]}));
+    assert_eq!(r["type"], "error", "{r}");
+    assert!(r["message"].as_str().unwrap().contains("trader"), "{r}");
+}
+
+#[test]
+fn an_unknown_filter_operator_is_refused() {
+    // The old fallback was `debug_assert!(false)` then `false` — and
+    // `debug_assert!` compiles out of the release build the wasm IS, so in
+    // production this matched nothing silently while the one build that would
+    // have caught it is the one nobody runs.
+    let (mut hub, mut ep) = ready();
+    let r = open_view(&mut ep, &mut hub, json!({
+        "filter":[{"column":"desk","op":"soundsLike","value":"Govies"}]}));
+    assert_eq!(r["type"], "error", "{r}");
+    assert!(r["message"].as_str().unwrap().contains("soundsLike"), "{r}");
+}
+
+#[test]
+fn a_predicate_that_will_not_parse_is_refused() {
+    // It became `Cond::BadExpr`, which evaluates to false — an empty result
+    // indistinguishable from a filter that genuinely matched nothing.
+    let (mut hub, mut ep) = ready();
+    let r = open_view(&mut ep, &mut hub, json!({
+        "filter":[{"expr":"qty >>> 5"}]}));
+    assert_eq!(r["type"], "error", "{r}");
+}
+
+#[test]
+fn every_operator_the_client_can_send_is_accepted() {
+    // The guard must not reject the vocabulary it exists to protect. This is
+    // the full set `toViewSpec` emits — if the engine ever stops handling one,
+    // the client would silently filter to nothing, so the list is the contract.
+    let (mut hub, mut ep) = ready();
+    for op in ["equals", "equalsIgnoreCase", "notEqual", "notEqualIgnoreCase",
+               "contains", "notContains", "startsWith", "endsWith",
+               "greaterThan", "greaterThanOrEqual", "lessThan", "lessThanOrEqual",
+               "inRange", "blank", "notBlank", "in"] {
+        let value = if op == "in" { json!(["Govies"]) } else { json!("Govies") };
+        let r = open_view(&mut ep, &mut hub, json!({
+            "filter":[{"column":"desk","op":op,"value":value,"valueTo":json!(99)}]}));
+        assert_eq!(r["type"], "result", "op {op} was rejected: {r}");
+    }
+}
+
+#[test]
+fn a_row_count_refuses_a_filter_it_cannot_honour() {
+    // A count sizes a scrollbar, so a silently-wrong one shows as a blotter of
+    // the wrong length rather than as an error.
+    let (mut hub, mut ep) = ready();
+    let r = ask(&mut ep, &mut hub, json!({"id":"c","type":"rowCount",
+        "ref":{"datasourceId":"positions","params":{}},
+        "view":{"filter":[{"column":"trader","op":"equals","value":"ann"}]}}));
+    assert_eq!(r["type"], "error", "{r}");
+}
+
+#[test]
+fn a_real_filter_still_counts_correctly() {
+    let (mut hub, mut ep) = ready();
+    let r = ask(&mut ep, &mut hub, json!({"id":"c","type":"rowCount",
+        "ref":{"datasourceId":"positions","params":{}},
+        "view":{"filter":[{"column":"desk","op":"equals","value":"Govies"}]}}));
+    assert_eq!(r["type"], "result", "{r}");
+    assert_eq!(r["payload"], 2);
+}
+

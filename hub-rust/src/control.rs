@@ -194,7 +194,7 @@ pub fn handle_control(hub: &mut Hub, session: &mut Session, msg: &Json) -> Optio
                 let mut refs: Vec<(&str, String)> = Vec::new();
                 for g in &group_by { refs.push(("group column", g.clone())); }
                 for a in &aggs { refs.push(("aggregate", a.column.clone())); }
-                if let Err(e) = crate::view::validate_columns(&c, &computed, &refs) {
+                if let Err(e) = crate::view::validate_columns_and_filter(&c, &computed, &refs, Some(&filter)) {
                     return Some(err(&id, "invalid-params", format!("watchGroups {e}")));
                 }
             }

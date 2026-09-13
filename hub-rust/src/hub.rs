@@ -62,7 +62,7 @@ impl Hub {
             for a in &parsed.aggs { refs.push(("aggregate", a.column.clone())); }
             for sp in &parsed.split_cols { refs.push(("splitBy column", sp.clone())); }
             for k in &parsed.sort { refs.push(("sort column", k.column.clone())); }
-            crate::view::validate_columns(&c, &parsed.computed, &refs)?;
+            crate::view::validate_columns_and_filter(&c, &parsed.computed, &refs, Some(&parsed.filter))?;
         }
         self.view_seq += 1;
         let view_id = format!("v{}", self.view_seq);
@@ -125,6 +125,10 @@ impl Hub {
             .ok_or_else(|| format!("no subscription for \"{datasource_id}\""))?;
         let cache = cache.lock().unwrap();
         let f = Filter::from_json(filter);
+        // A row count is a number a grid sizes its scrollbar from, so a filter
+        // that silently matched nothing or everything shows as a blotter the
+        // wrong length rather than as an error.
+        crate::view::validate_columns_and_filter(&cache, &[], &[], Some(&f))?;
         Ok(filtered_slots(&cache, &f).len())
     }
 
@@ -137,8 +141,8 @@ impl Hub {
         // missed: an aggregate over a column that does not resolve produced no
         // value and no complaint.
         let refs: Vec<(&str, String)> = specs.iter().map(|a| ("aggregate", a.column.clone())).collect();
-        crate::view::validate_columns(&cache, &[], &refs)?;
         let f = Filter::from_json(filter);
+        crate::view::validate_columns_and_filter(&cache, &[], &refs, Some(&f))?;
         let slots = filtered_slots(&cache, &f);
         Ok(aggregate_over(&cache, &slots, specs))
     }
@@ -156,7 +160,9 @@ impl Hub {
         if c.col_index(col).is_none() {
             return Err(format!("no column \"{col}\" on \"{datasource_id}\""));
         }
-        let slots = filtered_slots(&c, &Filter::from_json(ctx));
+        let f = Filter::from_json(ctx);
+        crate::view::validate_columns_and_filter(&c, &[], &[], Some(&f))?;
+        let slots = filtered_slots(&c, &f);
         Ok(group_slots(&c, &slots, col).into_iter().take(limit).map(|(v, _)| v.to_json()).collect())
     }
 

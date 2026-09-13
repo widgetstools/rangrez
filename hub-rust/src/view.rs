@@ -67,6 +67,42 @@ pub fn validate_columns(
     computed: &[ComputedCol],
     referenced: &[(&str, String)],
 ) -> Result<(), String> {
+    validate_columns_and_filter(cache, computed, referenced, None)
+}
+
+/// As `validate_columns`, plus everything a filter would silently mis-answer:
+/// columns it reads that do not resolve, operators no evaluator arm handles,
+/// and DSL predicates that would not parse. All three currently evaluate to a
+/// plain `false` or a plain `true` somewhere, which is a filtered result the
+/// caller cannot distinguish from a real one.
+pub fn validate_columns_and_filter(
+    cache: &TableCache,
+    computed: &[ComputedCol],
+    referenced: &[(&str, String)],
+    filter: Option<&Filter>,
+) -> Result<(), String> {
+    if let Some(f) = filter {
+        let errs = f.expression_errors();
+        if !errs.is_empty() {
+            return Err(format!("filter expression: {}", errs.join("; ")));
+        }
+        let ops = f.unsupported_ops();
+        if !ops.is_empty() {
+            return Err(format!("unsupported filter operator(s): {}", ops.join(", ")));
+        }
+    }
+    let filter_refs: Vec<(&str, String)> = filter
+        .map(|f| f.referenced_columns().into_iter().map(|c| ("filter column", c)).collect())
+        .unwrap_or_default();
+    let all: Vec<(&str, String)> = referenced.iter().cloned().chain(filter_refs).collect();
+    validate_refs(cache, computed, &all)
+}
+
+fn validate_refs(
+    cache: &TableCache,
+    computed: &[ComputedCol],
+    referenced: &[(&str, String)],
+) -> Result<(), String> {
     let mut bad: Vec<String> = Vec::new();
     let known = |name: &str| {
         computed.iter().any(|c| c.name == name) || cache.col_index(name).is_some()

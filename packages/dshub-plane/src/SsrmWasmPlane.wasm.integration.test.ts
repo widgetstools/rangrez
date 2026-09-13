@@ -516,3 +516,118 @@ describe('aggregates honour the request filter', () => {
   });
 });
 
+describe('the filter vocabulary is a contract with the engine', () => {
+  /**
+   * `toViewSpec.test.ts` pins sixteen operator names and a filter node shape
+   * against NO ENGINE — it asserts what the plane produces, never that the
+   * engine reads it. That is precisely how `spec.filter` shipped where the
+   * engine reads `view.filter`: a test existed, ran, passed, and asserted the
+   * wrong key against a fake that answers whatever shape it is handed.
+   *
+   * So this drives every operator the plane can emit through the REAL engine,
+   * and every expected count is discriminating: the fixture has four rows, so
+   * an operator that were ignored, unrecognised, or silently inverted would
+   * return 4 or 0 where a working one returns 1, 2 or 3.
+   */
+  const vcfg = {
+    ...cfg,
+    columnDefinitions: [
+      { field: 'id' }, { field: 'desk' }, { field: 'note' },
+      { field: 'mv', cellDataType: 'number' },
+    ],
+  } as SsrmPlaneConfig;
+
+  // Case deliberately differs between the two Govies rows: AG's text `equals`
+  // maps to `equalsIgnoreCase`, and only a real engine can confirm that.
+  const VROWS = [
+    { id: 'r1', desk: 'Govies', note: 'alpha', mv: 10 },
+    { id: 'r2', desk: 'govies', note: 'beta', mv: 20 },
+    { id: 'r3', desk: 'EM', note: '', mv: 30 },
+    { id: 'r4', desk: 'Credit', note: 'alphabet', mv: 40 },
+  ];
+
+  let plane: SsrmWasmPlane;
+  beforeAll(async () => {
+    plane = new SsrmWasmPlane(realHub);
+    await plane.boot('fv', vcfg);
+    await plane.attachSession('fvs');
+    await plane.ingest('fv', VROWS, false);
+  });
+
+  const count = async (filterModel: Record<string, unknown>) =>
+    (await plane.getRows('fvs', 'fv', { startRow: 0, endRow: 10, filterModel } as never)).rowCount;
+
+  const text = (type: string, filter: unknown) =>
+    ({ desk: { filterType: 'text', type, filter } });
+  const num = (type: string, filter: unknown, filterTo?: unknown) =>
+    ({ mv: { filterType: 'number', type, filter, ...(filterTo === undefined ? {} : { filterTo }) } });
+
+  it.each([
+    ['contains',            text('contains', 'gov'),        2],
+    ['notContains',         text('notContains', 'gov'),     2],
+    ['startsWith',          text('startsWith', 'gov'),      2],
+    ['endsWith',            text('endsWith', 'ies'),        2],
+    ['equals (ignores case)', text('equals', 'Govies'),     2],
+    ['notEqual',            text('notEqual', 'Govies'),     2],
+  ])('text %s', async (_name, model, expected) => {
+    expect(await count(model)).toBe(expected);
+  });
+
+  it.each([
+    ['equals',             num('equals', 20),            1],
+    ['notEqual',           num('notEqual', 20),          3],
+    ['greaterThan',        num('greaterThan', 20),       2],
+    ['greaterThanOrEqual', num('greaterThanOrEqual', 20), 3],
+    ['lessThan',           num('lessThan', 20),          1],
+    ['lessThanOrEqual',    num('lessThanOrEqual', 20),   2],
+    ['inRange',            num('inRange', 20, 30),       2],
+  ])('number %s', async (_name, model, expected) => {
+    expect(await count(model)).toBe(expected);
+  });
+
+  it('blank and notBlank read an empty string as blank', async () => {
+    expect(await count({ note: { filterType: 'text', type: 'blank' } })).toBe(1);
+    expect(await count({ note: { filterType: 'text', type: 'notBlank' } })).toBe(3);
+  });
+
+  it('a set filter picks exactly its values', async () => {
+    expect(await count({ desk: { filterType: 'set', values: ['EM'] } })).toBe(1);
+    expect(await count({ desk: { filterType: 'set', values: ['EM', 'Credit'] } })).toBe(2);
+  });
+
+  it('an EMPTY set selection matches nothing, not everything', async () => {
+    // The difference between an empty grid and an unfiltered one, and the kind
+    // of inversion no shape assertion can see.
+    expect(await count({ desk: { filterType: 'set', values: [] } })).toBe(0);
+  });
+
+  it('two conditions AND by default and OR when asked', async () => {
+    const and = {
+      mv: { filterType: 'number', operator: 'AND', conditions: [
+        { filterType: 'number', type: 'greaterThan', filter: 10 },
+        { filterType: 'number', type: 'lessThan', filter: 40 },
+      ] },
+    };
+    const or = { ...and, mv: { ...and.mv, operator: 'OR' } };
+    expect(await count(and)).toBe(2);   // 20, 30
+    expect(await count(or)).toBe(4);    // every row clears one side or the other
+  });
+
+  it('filters compose across columns', async () => {
+    expect(await count({
+      ...text('contains', 'gov'),
+      ...num('greaterThan', 15),
+    })).toBe(1);
+  });
+
+  it('an unresolvable filter column is refused, in both directions', async () => {
+    // Before: `equals` returned 0 rows and `notEqual` returned all of them,
+    // neither an error. The second is the expensive one — a blotter that looks
+    // filtered and is not.
+    await expect(count({ trader: { filterType: 'text', type: 'equals', filter: 'ann' } }))
+      .rejects.toThrow(/trader/);
+    await expect(count({ trader: { filterType: 'text', type: 'notEqual', filter: 'ann' } }))
+      .rejects.toThrow(/trader/);
+  });
+});
+

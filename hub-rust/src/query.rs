@@ -91,9 +91,19 @@ impl Leaf {
     }
 
     /// Evaluate this condition against a row cell. Mirrors `evalOp` exactly.
-    pub fn eval(&self, v: &Value) -> bool {
+    pub fn eval(&self, v: &Value) -> bool { self.eval_checked(v).unwrap_or(false) }
+
+    /// As `eval`, but `None` for an operator no arm handles.
+    ///
+    /// Split out so `known_op` can ask the question by PROBING this, rather
+    /// than against a second list that would drift from it. The old fallback
+    /// was `debug_assert!(false)` then `false`, and `debug_assert!` compiles
+    /// out of the release build the wasm is — so in production an unknown
+    /// operator matched nothing and said nothing, while the one build that
+    /// would have caught it was the one no client runs.
+    pub fn eval_checked(&self, v: &Value) -> Option<bool> {
         let needle = || fold_json(&self.value).unwrap_or_default();
-        match self.op.as_str() {
+        Some(match self.op.as_str() {
             "equals" | "equalsIgnoreCase" => { let f = fold(v); f.is_some() && f == fold_json(&self.value) }
             "notEqual" | "notEqualIgnoreCase" => fold(v) != fold_json(&self.value),
             "contains"    => fold(v).map_or(false, |s| s.contains(&needle())),
@@ -118,11 +128,8 @@ impl Leaf {
                     _ => false,
                 }
             }
-            other => {
-                debug_assert!(false, "unknown filter op {other:?}");
-                false
-            }
-        }
+            _ => return None,
+        })
     }
 }
 
@@ -135,13 +142,25 @@ pub enum Cond {
     Expr(crate::dsl::Ast),
     /// An expression that failed to parse — matches nothing rather than silently
     /// passing every row (a bad predicate must not widen a filter).
-    BadExpr,
+    /// A DSL predicate that would not parse, and the reason.
+    BadExpr(String),
 }
 
 /// A whole filter: AND across nodes, `or` nodes are any-of.
 #[derive(Debug, Clone, Default)]
 pub struct Filter {
     pub nodes: Vec<Cond>,
+}
+
+/// Does any `Leaf::eval` arm handle this operator?
+///
+/// Asked by PROBING `eval_checked` rather than against a second list, so the
+/// answer is by construction the same set the evaluator implements.
+pub fn known_op(op: &str) -> bool {
+    Leaf {
+        column: String::new(), op: op.to_string(),
+        value: Json::Null, value_to: Json::Null,
+    }.eval_checked(&Value::Null).is_some()
 }
 
 impl Filter {
@@ -155,7 +174,7 @@ impl Filter {
                 if let Some(expr) = o.get("expr").and_then(Json::as_str) {
                     nodes.push(match crate::dsl::parse(expr) {
                         Ok(ast) => Cond::Expr(ast),
-                        Err(_) => Cond::BadExpr,
+                        Err(e) => Cond::BadExpr(e),
                     });
                     continue;
                 }
@@ -173,6 +192,58 @@ impl Filter {
         Filter { nodes }
     }
 
+    /// Every column this filter reads, leaves and OR-branches alike.
+    ///
+    /// A leaf whose column does not resolve reads `Null`, and what happens next
+    /// depends entirely on the operator: `equals` matches nothing and empties
+    /// the grid, `notEqual` and `notContains` match everything and silently
+    /// disable the filter. Measured on the shipped engine — 0 rows and 2 rows
+    /// of 2 for the same bad column. A saved view naming a column that has
+    /// since been renamed hits this, and "I filtered to my book and it showed
+    /// everything" is the expensive half.
+    pub fn referenced_columns(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut push = |c: &str| {
+            if !c.is_empty() && !out.iter().any(|k: &String| k == c) { out.push(c.to_string()); }
+        };
+        for n in &self.nodes {
+            match n {
+                Cond::Leaf(l) => push(&l.column),
+                Cond::Or(leaves) => for l in leaves { push(&l.column); },
+                Cond::Expr(_) | Cond::BadExpr(_) => {}
+            }
+        }
+        out
+    }
+
+    /// Operators no `eval` arm handles. Such a leaf matches nothing.
+    pub fn unsupported_ops(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut check = |l: &Leaf| {
+            if !known_op(&l.op) && !out.iter().any(|k: &String| *k == l.op) {
+                out.push(l.op.clone());
+            }
+        };
+        for n in &self.nodes {
+            match n {
+                Cond::Leaf(l) => check(l),
+                Cond::Or(leaves) => for l in leaves { check(l); },
+                Cond::Expr(_) | Cond::BadExpr(_) => {}
+            }
+        }
+        out
+    }
+
+    /// Why any DSL predicate failed to parse. Non-empty must reject the
+    /// request: such a predicate evaluates to `false`, so the caller gets an
+    /// empty result that looks like a filter which simply matched nothing.
+    pub fn expression_errors(&self) -> Vec<String> {
+        self.nodes.iter().filter_map(|n| match n {
+            Cond::BadExpr(e) => Some(e.clone()),
+            _ => None,
+        }).collect()
+    }
+
     pub fn is_empty(&self) -> bool { self.nodes.is_empty() }
 
     /// Does a row match? `get(column)` returns the row's cell for that column.
@@ -184,7 +255,11 @@ impl Filter {
                 let dget = |name: &str| crate::dsl::DslValue::from_cell(&get(name));
                 crate::dsl::is_truthy(&crate::dsl::eval(ast, &dget))
             }
-            Cond::BadExpr => false,
+            // Unreachable once a verb validates; kept as the safe reading if
+            // one ever does not. Matching NOTHING is the conservative wrong
+            // answer — an empty blotter is at least visibly odd, where an
+            // unfiltered one looks like a filter that worked.
+            Cond::BadExpr(_) => false,
         })
     }
 }
