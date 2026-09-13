@@ -188,6 +188,18 @@ impl TableCache {
         Some(out)
     }
 
+    /// How many revisions the touch log holds, and how many it can.
+    ///
+    /// The CAP is the useful half: a consumer patching from revision R keeps
+    /// its fast path only while `current - R` stays under it. The depth
+    /// saturates within seconds of a feed starting and reads "full" from then
+    /// on, so it is a fill level, not headroom — see
+    /// `GroupWatch::revisions_behind` for the number that actually predicts a
+    /// fallback.
+    pub fn touch_log_depth(&self) -> (usize, usize) {
+        (self.touch_log.len(), self.touch_log_cap)
+    }
+
     /// Test seam: shrink the touch log so the fall-behind path can be exercised.
     pub fn set_touch_log_cap(&mut self, cap: usize) { self.touch_log_cap = cap.max(1); }
 

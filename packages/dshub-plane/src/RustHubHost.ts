@@ -27,6 +27,8 @@ export interface RustHubLike {
    */
   capabilities?(): string;
   mem_stats(): string;
+  /** Per-session diagnostics. Absent on engine builds before 0.8. */
+  diagnostics?(): string;
 }
 
 export type RustHubFactory = () => RustHubLike | Promise<RustHubLike>;

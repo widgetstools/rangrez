@@ -19,6 +19,7 @@ export const rusthub_rewind_shared_delta: (a: number, b: number, c: number, d: n
 export const rusthub_session_count: (a: number) => number;
 export const rusthub_capabilities: (a: number, b: number) => void;
 export const rusthub_mem_stats: (a: number, b: number) => void;
+export const rusthub_diagnostics: (a: number, b: number) => void;
 export const __wbindgen_add_to_stack_pointer: (a: number) => number;
 export const __wbindgen_malloc: (a: number, b: number) => number;
 export const __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;

@@ -340,4 +340,20 @@ impl RustHub {
     pub fn mem_stats(&self) -> String {
         serde_json::to_string(&self.hub.stats()).unwrap_or_else(|_| "{}".into())
     }
+
+    /// Per-session diagnostics: what each session holds, and whether its group
+    /// watches are still patching rather than rescanning.
+    ///
+    /// Read-only and cheap — it reports counters already being kept. Exposed
+    /// on the wasm surface because the browser is where this actually matters:
+    /// a watch that fell back to a full rescan is a 100x tick, and nothing
+    /// reported it, so it arrived as "the blotter feels slow today".
+    pub fn diagnostics(&self) -> String {
+        let sessions: Vec<serde_json::Value> =
+            self.sessions.values().map(|s| s.diagnostics()).collect();
+        serde_json::to_string(&serde_json::json!({
+            "hub": self.hub.stats(),
+            "sessions": sessions,
+        })).unwrap_or_else(|_| "{}".into())
+    }
 }

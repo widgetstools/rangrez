@@ -115,6 +115,16 @@ export class RustHub {
    * Diagnostics for the benchmark (datasource/view/row counts).
    */
   mem_stats(): string;
+  /**
+   * Per-session diagnostics: what each session holds, and whether its group
+   * watches are still patching rather than rescanning.
+   *
+   * Read-only and cheap — it reports counters already being kept. Exposed
+   * on the wasm surface because the browser is where this actually matters:
+   * a watch that fell back to a full rescan is a 100x tick, and nothing
+   * reported it, so it arrived as "the blotter feels slow today".
+   */
+  diagnostics(): string;
 }
 
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
@@ -139,6 +149,7 @@ export interface InitOutput {
   readonly rusthub_session_count: (a: number) => number;
   readonly rusthub_capabilities: (a: number, b: number) => void;
   readonly rusthub_mem_stats: (a: number, b: number) => void;
+  readonly rusthub_diagnostics: (a: number, b: number) => void;
   readonly __wbindgen_add_to_stack_pointer: (a: number) => number;
   readonly __wbindgen_malloc: (a: number, b: number) => number;
   readonly __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;

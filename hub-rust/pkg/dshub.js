@@ -512,6 +512,32 @@ export class RustHub {
             wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
         }
     }
+    /**
+     * Per-session diagnostics: what each session holds, and whether its group
+     * watches are still patching rather than rescanning.
+     *
+     * Read-only and cheap — it reports counters already being kept. Exposed
+     * on the wasm surface because the browser is where this actually matters:
+     * a watch that fell back to a full rescan is a 100x tick, and nothing
+     * reported it, so it arrived as "the blotter feels slow today".
+     * @returns {string}
+     */
+    diagnostics() {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            wasm.rusthub_diagnostics(retptr, this.__wbg_ptr);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            deferred1_0 = r0;
+            deferred1_1 = r1;
+            return getStringFromWasm0(r0, r1);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+        }
+    }
 }
 
 async function __wbg_load(module, imports) {

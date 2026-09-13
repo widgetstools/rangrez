@@ -351,6 +351,11 @@ pub fn handle_control(hub: &mut Hub, session: &mut Session, msg: &Json) -> Optio
 
         "stats" => Some(result(&id, hub.stats())),
 
+        // Everything `stats` cannot say: what THIS session holds, and whether
+        // its watches are still taking the fast path. Read-only and cheap — it
+        // reports counters already being kept, and computes nothing.
+        "diagnostics" => Some(result(&id, session.diagnostics())),
+
         "unsubscribe" => {
             if let Some((ds, params)) = parse_ref(msg) {
                 let key = crate::registry::Registry::cache_key(&ds, &params);

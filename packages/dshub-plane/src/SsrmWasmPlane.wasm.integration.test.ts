@@ -631,3 +631,96 @@ describe('the filter vocabulary is a contract with the engine', () => {
   });
 });
 
+describe('diagnostics say whether the fast path is still the fast path', () => {
+  /**
+   * The incremental group watch is 152x faster than the scan it replaced, and
+   * the win is conditional — on the folds being invertible, and on the touch
+   * log still reaching back. Either can stop holding in production without
+   * anything failing. Pinned against the real engine because the counters are
+   * only worth having if they survive the wasm boundary intact.
+   */
+  interface Diag {
+    hub: Record<string, unknown>;
+    sessions: Array<{
+      sessionId: string;
+      groupWatches: Array<{
+        datasourceId: string;
+        nodes: number;
+        touchLog: { behind: number; cap: number };
+        stats: { polls: number; incremental: number; slotsPatched: number;
+                 rebuilds: Record<string, number> };
+      }>;
+    }>;
+  }
+
+  it('reports a watch, its nodes, and its touch-log headroom', async () => {
+    const plane = new SsrmWasmPlane(realHub);
+    await plane.boot('dg', cfg);
+    await plane.attachSession('dgs');
+    await plane.ingest('dg', ROWS, false);
+    await plane.watchGroups('dgs', 'dg', { groupBy: ['desk'], aggregates: { mv: 'sum' } });
+    plane.pollAllTicks();
+
+    const d = plane.diagnostics() as Diag;
+    const session = d.sessions.find((s) => s.sessionId === 'dgs');
+    expect(session).toBeDefined();
+    expect(session!.groupWatches).toHaveLength(1);
+    const w = session!.groupWatches[0]!;
+    expect(w.datasourceId).toBe('dg');
+    expect(w.nodes).toBe(2);
+    expect(w.touchLog.cap).toBeGreaterThan(0);
+    // Just polled, so nothing to reach back for. `behind` crossing `cap` is
+    // the warning; the log's fill level is not.
+    expect(w.touchLog.behind).toBe(0);
+  });
+
+  it('counts the polls that patched rather than rescanned', async () => {
+    const plane = new SsrmWasmPlane(realHub);
+    await plane.boot('dg2', cfg);
+    await plane.attachSession('dg2s');
+    await plane.ingest('dg2', ROWS, false);
+    await plane.watchGroups('dg2s', 'dg2', { groupBy: ['desk'], aggregates: { mv: 'sum' } });
+    plane.pollAllTicks();
+    for (let i = 0; i < 5; i++) {
+      await plane.ingest('dg2', [{ ...ROWS[0]!, mv: 100 + i }], false);
+      plane.pollAllTicks();
+    }
+    const d = plane.diagnostics() as Diag;
+    const w = d.sessions.find((s) => s.sessionId === 'dg2s')!.groupWatches[0]!;
+    expect(w.stats.incremental).toBeGreaterThan(0);
+    // One row moved per tick — the count is the work done, against four rows
+    // the full scan would have read every time.
+    expect(w.stats.slotsPatched).toBeGreaterThan(0);
+    expect(w.stats.slotsPatched).toBeLessThan(w.stats.polls * ROWS.length);
+    expect(w.stats.rebuilds.logBehind).toBe(0);
+  });
+
+  it('names an uninvertible fold as such, not as a stale log', async () => {
+    // Different problems with different fixes: `min` is a capability gap, a
+    // fallen-behind log is a tick interval. A counter that said only "rebuilt"
+    // would send you tuning the wrong one.
+    const plane = new SsrmWasmPlane(realHub);
+    await plane.boot('dg3', cfg);
+    await plane.attachSession('dg3s');
+    await plane.ingest('dg3', ROWS, false);
+    await plane.watchGroups('dg3s', 'dg3', { groupBy: ['desk'], aggregates: { mv: 'min' } });
+    plane.pollAllTicks();
+    await plane.ingest('dg3', [{ ...ROWS[0]!, mv: 1 }], false);
+    plane.pollAllTicks();
+
+    const d = plane.diagnostics() as Diag;
+    const w = d.sessions.find((s) => s.sessionId === 'dg3s')!.groupWatches[0]!;
+    expect(w.stats.rebuilds.unsupported).toBeGreaterThan(0);
+    expect(w.stats.rebuilds.logBehind).toBe(0);
+    expect(w.stats.incremental).toBe(0);
+  });
+
+  it('is null on an engine build that has no such verb', () => {
+    // A caller must be able to tell "not supported" from "nothing to report".
+    const plane = new SsrmWasmPlane(() => ({
+      mem_stats: () => '{}',
+    }) as never);
+    expect(plane.diagnostics()).toBeNull();
+  });
+});
+

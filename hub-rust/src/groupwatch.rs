@@ -66,6 +66,45 @@ fn invertible_client(f: &str) -> bool { matches!(f, "sum" | "avg" | "count") }
 /// beside being wrong by an amount nobody can predict.
 const REBUILD_AFTER_MUTATIONS: u64 = 250_000;
 
+/// What a watch has actually been doing, so a fast path that has quietly
+/// become a slow one is visible rather than merely felt.
+///
+/// Counters, not gauges: "this watch has rebuilt 4,000 times" is the fact worth
+/// having, and an instantaneous reading taken while things are fine cannot
+/// carry it.
+#[derive(Default, Clone, Copy, Debug)]
+pub struct WatchStats {
+    pub polls: u64,
+    /// Polls served by patching only what moved.
+    pub incremental: u64,
+    /// Rebuilds, by cause. They are different problems: a watch that can never
+    /// be incremental is a capability gap, a log that fell behind is a tick
+    /// interval or a log cap, and drift is working as designed.
+    pub rebuilt_first: u64,
+    pub rebuilt_unsupported: u64,
+    pub rebuilt_log_behind: u64,
+    pub rebuilt_drift: u64,
+    /// Slots patched across every incremental poll — the work the full scan
+    /// would have done on every row instead.
+    pub slots_patched: u64,
+}
+
+impl WatchStats {
+    pub fn to_json(self) -> Json {
+        json!({
+            "polls": self.polls,
+            "incremental": self.incremental,
+            "rebuilds": {
+                "first": self.rebuilt_first,
+                "unsupported": self.rebuilt_unsupported,
+                "logBehind": self.rebuilt_log_behind,
+                "drift": self.rebuilt_drift,
+            },
+            "slotsPatched": self.slots_patched,
+        })
+    }
+}
+
 /// Running aggregates for ONE group node at one level.
 #[derive(Clone)]
 struct NodeState {
@@ -161,6 +200,7 @@ pub struct GroupWatch {
     /// next poll to rebuild — which is also how a fallen-behind touch log and a
     /// drift rebuild are expressed.
     incr: Option<Incr>,
+    stats: WatchStats,
     last: HashMap<Vec<String>, (Aggs, usize, Vec<Json>)>,
     /// Delivery conflation (config: conflation.defaultIntervalMs). Aggregates are
     /// flushed to the subscriber at most this often, coalescing bursts.
@@ -179,7 +219,7 @@ impl GroupWatch {
             for r in refs { if !agg_refs.contains(&r) { agg_refs.push(r); } }
         }
         GroupWatch { datasource_id, cache, filter, group_cols, aggs, computed, scopes, agg_refs,
-                     incr: None, last: HashMap::new(), conflate_ms, last_flush: None }
+                     incr: None, stats: WatchStats::default(), last: HashMap::new(), conflate_ms, last_flush: None }
     }
 
     fn computed_idx(&self, name: &str) -> Option<usize> {
@@ -432,13 +472,24 @@ impl GroupWatch {
     /// against.
     fn snapshot(&mut self) -> HashMap<Vec<String>, (Aggs, usize, Vec<Json>)> {
         let cache = self.cache.lock().unwrap();
+        self.stats.polls += 1;
         if self.incremental_ok() {
+            // Each way of reaching the slow path is a DIFFERENT problem, so
+            // they are counted apart rather than as one "rebuilt" total.
             let reusable = match &self.incr {
-                Some(i) if i.mutations < REBUILD_AFTER_MUTATIONS => cache.touched_since(i.rev),
-                _ => None,
+                None => { self.stats.rebuilt_first += 1; None }
+                Some(i) if i.mutations >= REBUILD_AFTER_MUTATIONS => {
+                    self.stats.rebuilt_drift += 1; None
+                }
+                Some(i) => match cache.touched_since(i.rev) {
+                    Some(t) => Some(t),
+                    None => { self.stats.rebuilt_log_behind += 1; None }
+                },
             };
             match reusable {
                 Some(touched) => {
+                    self.stats.incremental += 1;
+                    self.stats.slots_patched += touched.len() as u64;
                     let incr = self.incr.as_mut().expect("reusable implies present");
                     // Taken out so `patch_incr` can borrow `self` immutably
                     // alongside it; put back below.
@@ -462,8 +513,32 @@ impl GroupWatch {
                 }
             }
         }
+        self.stats.rebuilt_unsupported += 1;
         self.incr = None;
         self.full_snapshot(&cache)
+    }
+
+    /// What this watch has been doing. See `WatchStats`.
+    pub fn stats(&self) -> WatchStats { self.stats }
+
+    /// How many revisions this watch must reach back on its next poll.
+    ///
+    /// THE number that predicts a fallback, and not the same as how full the
+    /// touch log is — a ring buffer saturates within seconds of a feed
+    /// starting and reads "full" forever after, which says nothing. What
+    /// matters is the gap between the cache's revision and the one this watch
+    /// last patched to: once that exceeds the log's capacity, `touched_since`
+    /// answers `None` and the watch rescans. Approaching the cap is the
+    /// warning; at it, the fast path is already gone.
+    pub fn revisions_behind(&self) -> u64 {
+        let Some(incr) = self.incr.as_ref() else { return 0 };
+        self.cache.lock().map(|c| c.revision().saturating_sub(incr.rev)).unwrap_or(0)
+    }
+
+    /// Group nodes currently held, for the inventory.
+    pub fn node_count(&self) -> usize {
+        self.incr.as_ref().map(|i| i.nodes.iter().filter(|n| n.rows > 0).count())
+            .unwrap_or(self.last.len())
     }
 
     /// The unconditional rescan: every group node at every level, folded from
@@ -855,6 +930,156 @@ mod tests {
             }
             assert_agrees(&mut w, &format!("after tick {t}"));
         }
+    }
+
+    // ─────────────────────── what the counters are for ───────────────────
+    //
+    // The incremental path's whole value is conditional: on the folds being
+    // invertible, and on the touch log still reaching back. Both conditions can
+    // stop holding in production without anything failing, which is how a 152x
+    // win becomes a 1x one that nobody can point at. These pin that the
+    // counters tell those cases apart, because a counter that says "rebuilt"
+    // without saying WHY sends you looking in the wrong place.
+
+    #[test]
+    fn a_steady_feed_keeps_taking_the_fast_path() {
+        let c = cache();
+        let mut w = watch(&c, 2, weighted());
+        let mut rnd = lcg(3);
+        {
+            let mut cc = c.lock().unwrap();
+            for i in 0..100u32 {
+                cc.upsert(&format!("k{i}"), json!({
+                    "id": format!("k{i}"), "desk": DESKS[(rnd() % 4) as usize],
+                    "region": REGIONS[(rnd() % 3) as usize],
+                    "qty": (rnd() % 1000) as f64, "px": 1.0,
+                }).as_object().unwrap());
+            }
+        }
+        w.snapshot(); // the first build
+        for _ in 0..20 {
+            c.lock().unwrap().upsert("k1", json!({
+                "id":"k1","desk":"Rates","region":"US","qty":(rnd() % 999) as f64,"px":1.0
+            }).as_object().unwrap());
+            w.snapshot();
+        }
+        let st = w.stats();
+        assert_eq!(st.polls, 21);
+        assert_eq!(st.incremental, 20, "every poll after the build patched");
+        assert_eq!(st.rebuilt_first, 1);
+        assert_eq!(st.rebuilt_log_behind, 0);
+        assert_eq!(st.rebuilt_drift, 0);
+        // One slot moved per tick, against 100 the full scan would have read.
+        assert_eq!(st.slots_patched, 20);
+    }
+
+    #[test]
+    fn a_fallen_behind_log_is_counted_as_such() {
+        // Distinct from drift and from an unsupported fold: this one is fixed
+        // by polling more often or holding a longer log, and you can only know
+        // that if the counter says which it was.
+        let c = cache();
+        c.lock().unwrap().set_touch_log_cap(2);
+        let mut w = watch(&c, 1, Vec::new());
+        let mut rnd = lcg(4);
+        c.lock().unwrap().upsert("k0", json!({
+            "id":"k0","desk":"Rates","region":"US","qty":1.0,"px":1.0
+        }).as_object().unwrap());
+        w.snapshot();
+        for _ in 0..5 {
+            {
+                let mut cc = c.lock().unwrap();
+                for _ in 0..10 {
+                    cc.upsert(&format!("k{}", rnd() % 20), json!({
+                        "id":"kx","desk":"Rates","region":"US","qty":(rnd() % 99) as f64,"px":1.0
+                    }).as_object().unwrap());
+                }
+            }
+            w.snapshot();
+        }
+        let st = w.stats();
+        assert_eq!(st.rebuilt_log_behind, 5, "each poll outran the log");
+        assert_eq!(st.rebuilt_drift, 0);
+        assert_eq!(st.incremental, 0);
+    }
+
+    #[test]
+    fn an_uninvertible_fold_is_counted_apart_from_a_stale_log() {
+        // A `min` watch can never be incremental. That is a capability gap, not
+        // a tuning problem, and conflating the two sends you tuning a log cap
+        // that was never the cause.
+        let c = cache();
+        let mut w = GroupWatch::new("ds".into(), c.clone(), Filter::from_json(&Json::Null),
+            vec!["desk".into()],
+            vec![AggSpec { column: "qty".into(), agg: Agg::Min, out: "qty".into() }],
+            Vec::new(), 0);
+        c.lock().unwrap().upsert("k0", json!({
+            "id":"k0","desk":"Rates","region":"US","qty":1.0,"px":1.0
+        }).as_object().unwrap());
+        w.snapshot();
+        w.snapshot();
+        let st = w.stats();
+        assert_eq!(st.rebuilt_unsupported, 2);
+        assert_eq!(st.rebuilt_log_behind, 0);
+        assert_eq!(st.rebuilt_first, 0);
+        assert_eq!(st.incremental, 0);
+    }
+
+    #[test]
+    fn the_drift_rebuild_is_counted_as_drift() {
+        let c = cache();
+        let mut w = watch(&c, 1, Vec::new());
+        c.lock().unwrap().upsert("k0", json!({
+            "id":"k0","desk":"Rates","region":"US","qty":1.0,"px":1.0
+        }).as_object().unwrap());
+        w.snapshot();
+        w.incr.as_mut().unwrap().mutations = REBUILD_AFTER_MUTATIONS;
+        c.lock().unwrap().upsert("k1", json!({
+            "id":"k1","desk":"Rates","region":"US","qty":2.0,"px":1.0
+        }).as_object().unwrap());
+        w.snapshot();
+        let st = w.stats();
+        assert_eq!(st.rebuilt_drift, 1);
+        assert_eq!(st.rebuilt_log_behind, 0);
+    }
+
+    #[test]
+    fn a_watch_reports_how_far_behind_it_is() {
+        // The number that predicts a fallback. NOT the log's fill level, which
+        // saturates within seconds of a feed starting and then reads "full"
+        // forever while saying nothing about whether a rescan is near — a
+        // plausible gauge that answers the wrong question.
+        let c = cache();
+        c.lock().unwrap().set_touch_log_cap(8);
+        let mut w = watch(&c, 1, Vec::new());
+        c.lock().unwrap().upsert("k0", json!({
+            "id":"k0","desk":"Rates","region":"US","qty":1.0,"px":1.0
+        }).as_object().unwrap());
+        w.snapshot();
+        assert_eq!(w.revisions_behind(), 0, "just polled");
+
+        for i in 0..3u32 {
+            c.lock().unwrap().upsert(&format!("k{i}"), json!({
+                "id": format!("k{i}"), "desk":"Rates","region":"US","qty":2.0,"px":1.0
+            }).as_object().unwrap());
+        }
+        assert_eq!(w.revisions_behind(), 3, "three writes since the last poll");
+        // Under the cap, so the next poll still patches.
+        w.snapshot();
+        assert_eq!(w.stats().incremental, 1);
+        assert_eq!(w.revisions_behind(), 0);
+
+        // Past the cap, and the fast path is gone — which is what the number
+        // is for: it crosses `cap` BEFORE the rebuild shows up in the counters.
+        for i in 0..12u32 {
+            c.lock().unwrap().upsert(&format!("k{i}"), json!({
+                "id": format!("k{i}"), "desk":"EM","region":"US","qty":3.0,"px":1.0
+            }).as_object().unwrap());
+        }
+        let (_, cap) = c.lock().unwrap().touch_log_depth();
+        assert!(w.revisions_behind() > cap as u64, "behind {} vs cap {cap}", w.revisions_behind());
+        w.snapshot();
+        assert_eq!(w.stats().rebuilt_log_behind, 1, "and it did rescan");
     }
 
     #[test]

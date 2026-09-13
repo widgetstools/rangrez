@@ -928,6 +928,26 @@ export class SsrmWasmPlane {
     return parseJson(hub.mem_stats(), null);
   }
 
+  /**
+   * What each session holds, and whether its group watches are still patching
+   * rather than rescanning.
+   *
+   * The incremental group watch is 152x faster than the scan it replaced, and
+   * that win is CONDITIONAL — on the folds being invertible, and on the touch
+   * log still reaching back far enough. Either can stop holding in production
+   * without anything failing, which is how a fast path quietly becomes a slow
+   * one that arrives as "the blotter feels sluggish today". These are the
+   * counters that name it instead.
+   *
+   * `null` on an engine build that predates the verb, so a caller can tell
+   * "not supported" from "nothing to report".
+   */
+  diagnostics(): unknown {
+    const hub = this.host.current;
+    if (!hub || typeof hub.diagnostics !== 'function') return null;
+    return parseJson(hub.diagnostics(), null);
+  }
+
   /** `openView` + `readWindow` for one spec — shared by rows, counts and value lists. */
   private readView(
     hub: RustHubLike,

@@ -35,6 +35,41 @@ impl Session {
             subscriptions: HashSet::new(), outbox: Vec::new(), alerts: Vec::new(), open_views: HashSet::new(), deltas: Vec::new(), group_watches: Vec::new(), flow: Flow::new(500),
         }
     }
+    /// What this session is holding, and what its watches have been doing.
+    ///
+    /// The inventory half catches leaks — `watchGroups` and `alertSubscribe`
+    /// both stacked without removal at different times, and in both cases the
+    /// symptom was a tick that got slower for weeks with nothing to point at.
+    /// The counters half catches an incremental path that has quietly stopped
+    /// being incremental.
+    pub fn diagnostics(&self) -> Json {
+        serde_json::json!({
+            "sessionId": self.id,
+            "appId": self.app_id,
+            "subscriptions": self.subscriptions.len(),
+            "openViews": self.open_views.len(),
+            "alerts": self.alerts.len(),
+            "rowDeltaStreams": self.deltas.len(),
+            "outboxDepth": self.outbox.len(),
+            "groupWatches": self.group_watches.iter().map(|w| {
+                let (_, cap) = w.cache.lock().map(|c| c.touch_log_depth()).unwrap_or((0, 0));
+                serde_json::json!({
+                    "datasourceId": w.datasource_id,
+                    "groupBy": w.group_cols,
+                    "nodes": w.node_count(),
+                    "computedColumns": w.computed.len(),
+                    // `behind` is how far this watch must reach back next poll;
+                    // once it exceeds `cap` the log cannot answer and the watch
+                    // rescans. Deliberately NOT the log's fill level, which
+                    // saturates within seconds and then reads "full" forever
+                    // while saying nothing about whether a fallback is near.
+                    "touchLog": { "behind": w.revisions_behind(), "cap": cap },
+                    "stats": w.stats().to_json(),
+                })
+            }).collect::<Vec<_>>(),
+        })
+    }
+
     pub fn push(&mut self, msg: Json) { self.outbox.push(msg); }
     pub fn take_outbox(&mut self) -> Vec<Json> { std::mem::take(&mut self.outbox) }
 
