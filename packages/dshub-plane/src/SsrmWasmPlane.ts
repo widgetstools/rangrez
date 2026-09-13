@@ -804,6 +804,22 @@ export class SsrmWasmPlane {
    * is polled for each booted provider. Providers with nothing to say are
    * absent from the map.
    */
+  /**
+   * Whether to poll a provider's ROW-delta stream at all.
+   *
+   * On by default, because a client that needs streaming rows and does not get
+   * them looks broken in a way nobody attributes to a missing call. Turn it off
+   * for a provider whose only consumer reads group deltas — a server-side grid
+   * — and the engine stops materializing per-row JSON nothing will read.
+   *
+   * The stream is created lazily on first poll, so a provider switched off
+   * before its first tick never allocates one at all.
+   */
+  setRowDeltaEnabled(providerId: string, enabled: boolean): void {
+    if (enabled) this.rowDeltasOff.delete(providerId);
+    else this.rowDeltasOff.add(providerId);
+  }
+
   pollAllTicks(): Map<string, SsrmTickPayload[]> {
     const out = new Map<string, SsrmTickPayload[]>();
     const hub = this.host.current;
@@ -861,6 +877,16 @@ export class SsrmWasmPlane {
       }
     }
     for (const providerId of this.booted) {
+      // The ROW-delta stream is the CSRM path: one JSON object per changed
+      // row. A server-side grid never reads it — it folds group deltas and
+      // re-reads the windows it is showing — so for an SSRM-only provider
+      // this built ~60KB a tick and the consumer dropped every byte. Measured
+      // at 64% of the whole tick (0.95ms of 1.49ms at 500k rows, 400 moved).
+      //
+      // Opt-OUT rather than opt-in on purpose: a consumer that forgets to ask
+      // for row deltas would silently stop updating, which is the failure this
+      // codebase has too much of already. Forgetting to opt out costs time.
+      if (this.rowDeltasOff.has(providerId)) continue;
       const dstr = hub.poll_shared_delta(providerId, EMPTY_PARAMS);
       if (!dstr) continue;
       const m = parseJson<{
@@ -1017,6 +1043,9 @@ export class SsrmWasmPlane {
     this.subscribed.add(sessionId);
     this.sessionProvider.set(sessionId, providerId);
   }
+
+  /** Providers whose row-delta stream has no reader — see `setRowDeltaEnabled`. */
+  private readonly rowDeltasOff = new Set<string>();
 
   private control(hub: RustHubLike, sessionId: string, msg: Record<string, unknown>): SsrmControlReply[] {
     const replies = parseJson<SsrmControlReply[]>(hub.on_control(sessionId, JSON.stringify(msg)), []);

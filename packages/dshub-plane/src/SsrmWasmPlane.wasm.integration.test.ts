@@ -401,3 +401,67 @@ describe('computed columns on a group watch', () => {
   });
 });
 
+describe('the row-delta stream is only polled when something reads it', () => {
+  /**
+   * A server-side grid folds GROUP deltas and re-reads the windows it shows;
+   * it never looks at the row-delta stream. Polling it anyway made the engine
+   * materialize one JSON object per changed row — ~60KB a tick at 400 rows,
+   * measured at 64% of the whole tick — for a consumer that dropped every byte.
+   *
+   * On by default: a client that needs streaming rows and silently stops
+   * getting them is a worse failure than a slow one.
+   */
+  async function planeWith(id: string) {
+    const plane = new SsrmWasmPlane(realHub);
+    await plane.boot(id, cfg);
+    await plane.attachSession(`${id}s`);
+    await plane.ingest(id, ROWS, false);
+    plane.pollAllTicks();
+    return plane;
+  }
+
+  it('delivers row deltas by default', async () => {
+    const plane = await planeWith('rd1');
+    await plane.ingest('rd1', [{ ...ROWS[0]!, mv: 999 }], false);
+    const ticks = plane.pollAllTicks().get('rd1') ?? [];
+    expect(ticks.some((t) => t.kind === 'rowDelta')).toBe(true);
+  });
+
+  it('stops delivering them once switched off', async () => {
+    const plane = await planeWith('rd2');
+    plane.setRowDeltaEnabled('rd2', false);
+    await plane.ingest('rd2', [{ ...ROWS[0]!, mv: 999 }], false);
+    const ticks = plane.pollAllTicks().get('rd2') ?? [];
+    expect(ticks.some((t) => t.kind === 'rowDelta')).toBe(false);
+  });
+
+  it('still delivers GROUP deltas while row deltas are off', async () => {
+    // The whole point: the server-side grid keeps working, and keeps working
+    // on the stream it actually folds.
+    const plane = await planeWith('rd3');
+    plane.setRowDeltaEnabled('rd3', false);
+    await plane.watchGroups('rd3s', 'rd3', { groupBy: ['desk'], aggregates: { mv: 'sum' } });
+    plane.pollAllTicks();
+    await plane.ingest('rd3', [{ ...ROWS[0]!, mv: 999 }], false);
+    const ticks = plane.pollAllTicks().get('rd3') ?? [];
+    const groups = ticks.filter((t) => t.kind === 'groupDelta').flatMap((t) => t.groups ?? []);
+    expect(groups.length).toBeGreaterThan(0);
+    expect(ticks.some((t) => t.kind === 'rowDelta')).toBe(false);
+  });
+
+  it('resumes when switched back on', async () => {
+    const plane = await planeWith('rd4');
+    plane.setRowDeltaEnabled('rd4', false);
+    await plane.ingest('rd4', [{ ...ROWS[0]!, mv: 111 }], false);
+    plane.pollAllTicks();
+    plane.setRowDeltaEnabled('rd4', true);
+    await plane.ingest('rd4', [{ ...ROWS[1]!, mv: 222 }], false);
+    const ticks = plane.pollAllTicks().get('rd4') ?? [];
+    const delta = ticks.find((t) => t.kind === 'rowDelta');
+    expect(delta).toBeDefined();
+    // The stream is created at the revision of its FIRST poll, so resuming
+    // reports what changed from there — not a silent gap, and not nothing.
+    expect((delta as { upserts?: unknown[] }).upserts?.length).toBeGreaterThan(0);
+  });
+});
+
