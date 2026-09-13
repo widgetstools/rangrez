@@ -6,7 +6,7 @@
 //! shapes identical is what lets the existing browser `ControlClient` talk to
 //! the Rust hub with no change.
 
-use crate::hub::{parse_agg_specs, Hub};
+use crate::hub::{parse_agg_specs_checked, Hub};
 use crate::session::Session;
 use crate::store::Value;
 use serde_json::{json, Value as Json};
@@ -124,7 +124,13 @@ pub fn handle_control(hub: &mut Hub, session: &mut Session, msg: &Json) -> Optio
             let Some((ds, params)) = parse_ref(msg) else {
                 return Some(err(&id, "invalid-params", "malformed alertSubscribe: missing ref".into()));
             };
-            let rule_id = msg.get("ruleId").and_then(Json::as_str).unwrap_or("rule").to_string();
+            // An unnamed rule used to default to "rule", so two of them shared
+            // one identity: unsubscribing either killed both, and with the
+            // stacking below they fired twice each.
+            let rule_id = match msg.get("ruleId").and_then(Json::as_str) {
+                Some(r) if !r.is_empty() => r.to_string(),
+                _ => return Some(err(&id, "invalid-params", "alertSubscribe needs a ruleId".into())),
+            };
             let predicate = msg.get("predicate").and_then(Json::as_str).unwrap_or("");
             let ast = match crate::dsl::parse(predicate) {
                 Ok(a) => a,
@@ -137,6 +143,13 @@ pub fn handle_control(hub: &mut Hub, session: &mut Session, msg: &Json) -> Optio
             // Initial fire for rows already over the line — delivered via outbox.
             for m in sub.poll(None) { session.push(m); }
             let active = sub.watcher.active_count();
+            // REPLACE this session's subscription for this rule, do not stack a
+            // second one beside it — the same bug `watchGroups` had. A client
+            // re-registers whenever its rule is edited, and every stacked copy
+            // scans the whole table on every tick and fires its own duplicate
+            // alert. `alertUnsubscribe` exists, but relying on a client to call
+            // it is relying on the one thing that goes wrong.
+            session.alerts.retain(|a| a.rule_id != rule_id);
             session.alerts.push(sub);
             Some(json!({ "id": id, "type": "result", "payload": { "ruleId": rule_id, "watching": true, "activeCount": active } }))
         }
@@ -303,10 +316,21 @@ pub fn handle_control(hub: &mut Hub, session: &mut Session, msg: &Json) -> Optio
             let mut out = Vec::new();
             if let Some(dss) = bundle.and_then(|b| b.get("datasources")).and_then(Json::as_array) {
                 for cfg in dss {
-                    if let Some(ds) = parse_datasource(cfg) {
-                        let dsid = ds.id.clone();
-                        let reload = hub.registry.replace_datasource(ds);
-                        out.push(json!({ "id": dsid, "reload": reload }));
+                    match parse_datasource(cfg) {
+                        Some(ds) => {
+                            let dsid = ds.id.clone();
+                            let reload = hub.registry.replace_datasource(ds);
+                            out.push(json!({ "id": dsid, "reload": reload }));
+                        }
+                        // Silently dropping this was the worst version: a hot
+                        // reload whose config had a typo left the OLD datasource
+                        // running and reported success, so the fix a desk was
+                        // waiting on simply never arrived. `bootstrap` already
+                        // reports `invalid`; this is the same contract.
+                        None => out.push(json!({
+                            "id": cfg.get("id").cloned().unwrap_or(Json::Null),
+                            "status": "invalid",
+                        })),
                     }
                 }
             }
@@ -351,7 +375,11 @@ pub fn handle_control(hub: &mut Hub, session: &mut Session, msg: &Json) -> Optio
             let Some((ds, params)) = parse_ref(msg) else {
                 return Some(err(&id, "invalid-params", "malformed aggregates: missing ref".into()));
             };
-            let specs = parse_agg_specs(msg.get("specs").unwrap_or(&json!([])));
+            let (specs, bad) = parse_agg_specs_checked(msg.get("specs").unwrap_or(&json!([])));
+            if !bad.is_empty() {
+                return Some(err(&id, "invalid-params",
+                    format!("aggregates: {}", bad.join("; "))));
+            }
             let filter = msg.get("view").and_then(|v| v.get("filter")).cloned().unwrap_or(json!([]));
             match hub.aggregates(&ds, &params, &specs, &filter) {
                 Ok(map) => {

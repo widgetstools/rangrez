@@ -667,7 +667,12 @@ export class SsrmWasmPlane {
           fn: s.fn,
           as: s.as ?? `${s.column}_${s.fn}`,
         })),
-        spec: { filter: spec.filter },
+        // `view`, not `spec`. The engine reads the filter from `view.filter`
+        // (as it does for rowCount, watchGroups and openView); a misplaced key
+        // is not an error, it just means "no filter", so this returned
+        // WHOLE-TABLE aggregates under an active filter. A footer total that is
+        // confidently wrong beats a blank one for damage.
+        view: { filter: spec.filter },
       }),
       id,
     );

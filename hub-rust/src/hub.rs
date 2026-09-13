@@ -133,6 +133,11 @@ impl Hub {
         let cache = self.registry.cache_for(datasource_id, params)
             .ok_or_else(|| format!("no subscription for \"{datasource_id}\""))?;
         let cache = cache.lock().unwrap();
+        // The third caller of `aggregate_over`, and the one the earlier pass
+        // missed: an aggregate over a column that does not resolve produced no
+        // value and no complaint.
+        let refs: Vec<(&str, String)> = specs.iter().map(|a| ("aggregate", a.column.clone())).collect();
+        crate::view::validate_columns(&cache, &[], &refs)?;
         let f = Filter::from_json(filter);
         let slots = filtered_slots(&cache, &f);
         Ok(aggregate_over(&cache, &slots, specs))
@@ -144,6 +149,13 @@ impl Hub {
     pub fn distinct_values(&self, datasource_id: &str, params: &Json, col: &str, ctx: &Json, limit: usize) -> Result<Vec<Json>, String> {
         let cache = self.registry.cache_for(datasource_id, params).ok_or_else(|| format!("no subscription for \"{datasource_id}\""))?;
         let c = cache.lock().unwrap();
+        // `group_slots` answers an empty list for a column it cannot resolve,
+        // which is byte-identical to a column that genuinely has no values. A
+        // filter dropdown then shows nothing and the user concludes the data is
+        // empty rather than that the request was wrong.
+        if c.col_index(col).is_none() {
+            return Err(format!("no column \"{col}\" on \"{datasource_id}\""));
+        }
         let slots = filtered_slots(&c, &Filter::from_json(ctx));
         Ok(group_slots(&c, &slots, col).into_iter().take(limit).map(|(v, _)| v.to_json()).collect())
     }
@@ -183,15 +195,35 @@ fn json_str(v: &Json) -> String {
 }
 
 /// Parse `msg.specs` (`[{column, fn, as?}]`) into aggregate specs.
-pub fn parse_agg_specs(specs: &Json) -> Vec<AggSpec> {
-    specs.as_array().map(|a| a.iter().filter_map(|s| {
-        let o = s.as_object()?;
-        let column = o.get("column").and_then(Json::as_str)?.to_string();
-        let f = o.get("fn").and_then(Json::as_str)?;
-        let agg = Agg::parse(f)?;
-        let out = o.get("as").and_then(Json::as_str)
+/// Parse `specs` into aggregates, and say which entries could not be.
+///
+/// This used to `filter_map` the bad ones away, so `{"column":"qty","fn":"tolal"}`
+/// produced no aggregate and no complaint — the caller got a result object
+/// missing one key, which reads as "that number is not available" rather than
+/// "you typed the function name wrong".
+pub fn parse_agg_specs_checked(specs: &Json) -> (Vec<AggSpec>, Vec<String>) {
+    let mut out = Vec::new();
+    let mut bad = Vec::new();
+    let Some(arr) = specs.as_array() else { return (out, bad); };
+    for s in arr {
+        let Some(o) = s.as_object() else { bad.push("aggregate spec is not an object".into()); continue; };
+        let Some(column) = o.get("column").and_then(Json::as_str) else {
+            bad.push("aggregate spec without `column`".into()); continue;
+        };
+        let Some(f) = o.get("fn").and_then(Json::as_str) else {
+            bad.push(format!("aggregate on \"{column}\" without `fn`")); continue;
+        };
+        let Some(agg) = Agg::parse(f) else {
+            bad.push(format!("unknown aggregate \"{f}\" on \"{column}\"")); continue;
+        };
+        let out_name = o.get("as").and_then(Json::as_str)
             .map(str::to_string)
             .unwrap_or_else(|| format!("{f}({column})"));
-        Some(AggSpec { column, agg, out })
-    }).collect()).unwrap_or_default()
+        out.push(AggSpec { column: column.to_string(), agg, out: out_name });
+    }
+    (out, bad)
+}
+
+pub fn parse_agg_specs(specs: &Json) -> Vec<AggSpec> {
+    parse_agg_specs_checked(specs).0
 }

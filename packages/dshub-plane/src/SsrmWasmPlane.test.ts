@@ -354,7 +354,7 @@ describe('SsrmWasmPlane', () => {
       let captured: Record<string, unknown> | undefined;
       const inner = hub.on_control;
       hub.on_control = (sid, msgJson) => {
-        const msg = JSON.parse(msgJson) as { id: string; type: string; specs?: unknown; spec?: unknown };
+        const msg = JSON.parse(msgJson) as { id: string; type: string; specs?: unknown; view?: unknown };
         if (msg.type === 'aggregates') {
           captured = msg;
           return JSON.stringify([{
@@ -373,7 +373,13 @@ describe('SsrmWasmPlane', () => {
       });
       expect(result).toEqual({ values: { marketValue_sum: 12.5 } });
       expect(captured?.specs).toEqual([{ column: 'marketValue', fn: 'sum', as: 'marketValue_sum' }]);
-      expect((captured?.spec as { filter?: unknown[] })?.filter).toEqual([
+      // `view.filter`, which is where the engine reads it from. This asserted
+      // `spec.filter` for as long as the plane sent it there — and could not
+      // catch the mistake, because a fake hub answers whatever shape it is
+      // handed. Against the real engine the misplaced key silently meant "no
+      // filter", so aggregates came back whole-table; the integration suite
+      // pins that end of it.
+      expect((captured?.view as { filter?: unknown[] })?.filter).toEqual([
         { column: 'desk', op: 'equalsIgnoreCase', value: 'Govies' },
       ]);
     });

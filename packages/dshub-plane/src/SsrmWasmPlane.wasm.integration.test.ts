@@ -465,3 +465,54 @@ describe('the row-delta stream is only polled when something reads it', () => {
   });
 });
 
+describe('aggregates honour the request filter', () => {
+  /**
+   * The plane sent the filter under `spec`, the engine reads it from `view`,
+   * and a misplaced key is not an error — it just means "no filter". So a
+   * status-bar total under an active filter reported the WHOLE TABLE. Pinned
+   * against the real engine because only the engine can say whether the key it
+   * was handed is the key it reads.
+   */
+  const fcfg = {
+    ...cfg,
+    columnDefinitions: [{ field: 'id' }, { field: 'desk' }, { field: 'mv', cellDataType: 'number' }],
+  } as SsrmPlaneConfig;
+
+  async function planeWith(id: string) {
+    const plane = new SsrmWasmPlane(realHub);
+    await plane.boot(id, fcfg);
+    await plane.attachSession(`${id}s`);
+    await plane.ingest(id, [
+      { id: 'r1', desk: 'Rates', mv: 10 },
+      { id: 'r2', desk: 'Rates', mv: 20 },
+      { id: 'r3', desk: 'Credit', mv: 100 },
+    ], false);
+    return plane;
+  }
+
+  it('sums only the filtered rows', async () => {
+    // Rates is 30. The whole table is 130 — the number this used to return.
+    const plane = await planeWith('af1');
+    const res = await plane.getAggregates('af1s', 'af1', {
+      specs: [{ column: 'mv', fn: 'sum', as: 'total' }],
+      filterModel: { desk: { filterType: 'text', type: 'equals', filter: 'Rates' } },
+    } as never);
+    expect(res.values.total).toBe(30);
+  });
+
+  it('still sums everything when no filter is given', async () => {
+    const plane = await planeWith('af2');
+    const res = await plane.getAggregates('af2s', 'af2', {
+      specs: [{ column: 'mv', fn: 'sum', as: 'total' }],
+    } as never);
+    expect(res.values.total).toBe(130);
+  });
+
+  it('refuses an aggregate over a column that does not resolve', async () => {
+    const plane = await planeWith('af3');
+    await expect(plane.getAggregates('af3s', 'af3', {
+      specs: [{ column: 'notional', fn: 'sum', as: 't' }],
+    } as never)).rejects.toThrow(/notional/);
+  });
+});
+
