@@ -318,6 +318,19 @@ impl Agg {
     }
 }
 
+/// Does this cell contribute to a numeric fold, and as what?
+///
+/// `None` for a blank or a non-numeric string — the values `MultiAcc::add`
+/// skips. Extracted so the group watch's incremental accumulator counts
+/// exactly what a full fold counts; a disagreement here would show up as an
+/// aggregate that drifts only for rows of a particular shape, which is close
+/// to unfindable in production.
+pub fn numeric_cell(v: &Value) -> Option<f64> {
+    if is_blank(v) { return None; }
+    let x = to_number(v);
+    if x.is_nan() { None } else { Some(x) }
+}
+
 /// One aggregate to compute: `fn(column)`, output-named.
 #[derive(Debug, Clone)]
 pub struct AggSpec { pub column: String, pub agg: Agg, pub out: String }
@@ -372,9 +385,7 @@ impl MultiAcc {
             if !is_blank(cell) { self.distinct[si].insert(group_key(cell)); }
             return;
         }
-        if is_blank(cell) { return; }
-        let x = to_number(cell);
-        if x.is_nan() { return; }
+        let Some(x) = numeric_cell(cell) else { return; };
         self.sum[si] += x;
         self.n[si] += 1;
         if x < self.min[si] { self.min[si] = x; }
