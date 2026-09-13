@@ -8,8 +8,10 @@
 //! pushes ONLY the group paths whose aggregate actually changed (plus any that
 //! vanished). The client refreshes exactly those group rows.
 
-use crate::query::{aggregate_over, filtered_slots, group_key_string, group_slots, AggSpec, Filter};
+use crate::expr::client_aggregate;
+use crate::query::{filtered_slots, group_key_string, AggSpec, Filter, MultiAcc};
 use crate::store::{TableCache, Value};
+use crate::view::{ComputedCol, Scope};
 use indexmap::IndexMap;
 use serde_json::{json, Value as Json};
 use std::collections::HashMap;
@@ -24,6 +26,12 @@ pub struct GroupWatch {
     pub filter: Filter,
     pub group_cols: Vec<String>,
     pub aggs: Vec<AggSpec>,
+    /// Engine-computed columns, evaluated per node — see `Scope`.
+    pub computed: Vec<ComputedCol>,
+    scopes: Vec<Scope>,
+    /// Every `agg` node across the computed expressions, deduplicated. Folded
+    /// once per node, not once per view.
+    agg_refs: Vec<(String, String)>,
     last: HashMap<Vec<String>, (Aggs, usize, Vec<Json>)>,
     /// Delivery conflation (config: conflation.defaultIntervalMs). Aggregates are
     /// flushed to the subscriber at most this often, coalescing bursts.
@@ -32,28 +40,180 @@ pub struct GroupWatch {
 }
 
 impl GroupWatch {
-    pub fn new(datasource_id: String, cache: Arc<Mutex<TableCache>>, filter: Filter, group_cols: Vec<String>, aggs: Vec<AggSpec>, conflate_ms: u64) -> GroupWatch {
-        GroupWatch { datasource_id, cache, filter, group_cols, aggs, last: HashMap::new(), conflate_ms, last_flush: None }
+    pub fn new(datasource_id: String, cache: Arc<Mutex<TableCache>>, filter: Filter, group_cols: Vec<String>, aggs: Vec<AggSpec>, computed: Vec<ComputedCol>, conflate_ms: u64) -> GroupWatch {
+        let mut agg_refs: Vec<(String, String)> = Vec::new();
+        let mut scopes = Vec::with_capacity(computed.len());
+        for cc in &computed {
+            scopes.push(cc.scope());
+            let mut refs = Vec::new();
+            cc.expr.agg_refs(&mut refs);
+            for r in refs { if !agg_refs.contains(&r) { agg_refs.push(r); } }
+        }
+        GroupWatch { datasource_id, cache, filter, group_cols, aggs, computed, scopes, agg_refs,
+                     last: HashMap::new(), conflate_ms, last_flush: None }
+    }
+
+    fn computed_idx(&self, name: &str) -> Option<usize> {
+        self.computed.iter().position(|c| c.name == name)
     }
 
     /// Aggregates for every group node at every level, keyed by group path.
     fn snapshot(&self) -> HashMap<Vec<String>, (Aggs, usize, Vec<Json>)> {
         let cache = self.cache.lock().unwrap();
         let slots = filtered_slots(&cache, &self.filter);
+        // Row-scoped columns are node-independent, so they are evaluated ONCE
+        // over the filtered set rather than per node per level. That is what
+        // keeps this affordable: a two-level grouping visits every row twice,
+        // and re-deriving `spread * dv01` on each visit would double the scan
+        // this path is fast because of.
+        let row_vals = self.eval_row_scoped(&cache, &slots);
         let mut out = HashMap::new();
-        self.collect(&cache, &slots, &[], &[], 0, &mut out);
+        self.collect(&cache, &slots, &[], &[], 0, &row_vals, &mut out);
         out
     }
 
-    fn collect(&self, cache: &TableCache, slots: &[usize], path: &[String], values: &[Json], level: usize, out: &mut HashMap<Vec<String>, (Aggs, usize, Vec<Json>)>) {
+    /// Evaluate every `Scope::Row` computed column across the filtered set.
+    /// Returns `[computed idx][slot]`, empty for columns of other scopes.
+    fn eval_row_scoped(&self, cache: &TableCache, slots: &[usize]) -> Vec<Vec<Value>> {
+        let n = self.computed.len();
+        let mut vals: Vec<Vec<Value>> = vec![Vec::new(); n];
+        if n == 0 { return vals; }
+        let nslots = cache.slot_count();
+        let mut any = false;
+        for (k, sc) in self.scopes.iter().enumerate() {
+            if *sc == Scope::Row { vals[k] = vec![Value::Null; nslots]; any = true; }
+        }
+        if !any { return vals; }
+        let no_agg = |_: &str, _: &str| Value::Null; // Scope::Row has no agg nodes
+        for &slot in slots {
+            if !cache.is_live(slot) { continue; }
+            let mut rowvals: Vec<Value> = Vec::with_capacity(n);
+            for (k, cc) in self.computed.iter().enumerate() {
+                if self.scopes[k] != Scope::Row { rowvals.push(Value::Null); continue; }
+                let get = |name: &str| -> Value {
+                    // An earlier computed column of this same pass, else the
+                    // cache. A forward reference reads Null rather than
+                    // recursing — declaration order is the contract.
+                    if let Some(j) = self.computed_idx(name) {
+                        return rowvals.get(j).cloned().unwrap_or(Value::Null);
+                    }
+                    cache.col_index(name).map(|ci| cache.cell(slot, ci).clone()).unwrap_or(Value::Null)
+                };
+                rowvals.push(cc.expr.eval(&get, &no_agg));
+            }
+            for (k, v) in rowvals.into_iter().enumerate() {
+                if !vals[k].is_empty() { vals[k][slot] = v; }
+            }
+        }
+        vals
+    }
+
+    /// One cell as the group watch sees it: a row-scoped computed column from
+    /// the precomputed table, otherwise the raw cache cell.
+    fn value_of(&self, cache: &TableCache, slot: usize, name: &str, row_vals: &[Vec<Value>]) -> Value {
+        if let Some(k) = self.computed_idx(name) {
+            return row_vals[k].get(slot).cloned().unwrap_or(Value::Null);
+        }
+        cache.col_index(name).map(|ci| cache.cell(slot, ci).clone()).unwrap_or(Value::Null)
+    }
+
+    /// Group by one column's value, resolving row-scoped computed columns, so
+    /// a grouping level can be an expression the cache never stored.
+    fn group_slots_scoped(&self, cache: &TableCache, slots: &[usize], col: &str, row_vals: &[Vec<Value>]) -> Vec<(Value, Vec<usize>)> {
+        let mut map: IndexMap<String, (Value, Vec<usize>)> = IndexMap::new();
+        for &slot in slots {
+            let gv = self.value_of(cache, slot, col, row_vals);
+            map.entry(group_key_string(&gv)).or_insert_with(|| (gv, Vec::new())).1.push(slot);
+        }
+        map.into_iter().map(|(_, v)| v).collect()
+    }
+
+    /// Every aggregate this node reports: the requested `AggSpec`s, plus the
+    /// caption value of each node-scoped computed column.
+    fn node_aggs(&self, cache: &TableCache, members: &[usize], row_vals: &[Vec<Value>]) -> Aggs {
+        // 1. Fold each `agg` node over THIS node's members. One scalar set per
+        //    node is the difference between a desk's weighted spread and the
+        //    whole book's.
+        let scalars: Vec<Value> = self.agg_refs.iter().map(|(f, c)| {
+            let mut it = members.iter().map(|&slot| self.value_of(cache, slot, c, row_vals));
+            client_aggregate(f, &mut it)
+        }).collect();
+        let agg = |f: &str, c: &str| -> Value {
+            self.agg_refs.iter().position(|(af, ac)| af == f && ac == c)
+                .and_then(|i| scalars.get(i).cloned()).unwrap_or(Value::Null)
+        };
+
+        // 2. Node-scoped computed columns — evaluated once, in declaration
+        //    order so a later one can read an earlier one.
+        let mut node_vals: Vec<Value> = vec![Value::Null; self.computed.len()];
+        for (k, cc) in self.computed.iter().enumerate() {
+            if self.scopes[k] != Scope::Node { continue; }
+            let v = {
+                let get = |name: &str| -> Value {
+                    self.computed_idx(name).map(|j| node_vals[j].clone()).unwrap_or(Value::Null)
+                };
+                cc.expr.eval(&get, &agg)
+            };
+            node_vals[k] = v;
+        }
+
+        // 3. The requested aggregates, over the same members.
+        let mut acc = MultiAcc::new(&self.aggs);
+        for &slot in members {
+            acc.add_row();
+            for (si, spec) in self.aggs.iter().enumerate() {
+                let cell = match self.computed_idx(&spec.column) {
+                    Some(k) => match self.scopes[k] {
+                        Scope::Row => row_vals[k].get(slot).cloned().unwrap_or(Value::Null),
+                        // Constant across the node; aggregating it is legal
+                        // (and `avg` of a constant is that constant).
+                        Scope::Node => node_vals[k].clone(),
+                        Scope::NodeRow => self.eval_node_row(cache, slot, k, row_vals, &node_vals, &agg),
+                    },
+                    None => cache.col_index(&spec.column)
+                        .map(|ci| cache.query_value(slot, ci)).unwrap_or(Value::Null),
+                };
+                acc.add(si, spec, &cell);
+            }
+        }
+        let mut out = acc.finish(&self.aggs);
+
+        // 4. Caption values. Only node-scoped columns have one; a row-scoped or
+        //    mixed column has no single value here and is reported through
+        //    `aggregates` instead, where the client says how to fold it.
+        for (k, cc) in self.computed.iter().enumerate() {
+            if self.scopes[k] == Scope::Node { out.insert(cc.name.clone(), node_vals[k].clone()); }
+        }
+        out
+    }
+
+    /// A mixed-scope computed column at one row inside one node.
+    fn eval_node_row(&self, cache: &TableCache, slot: usize, k: usize, row_vals: &[Vec<Value>], node_vals: &[Value], agg: &dyn Fn(&str, &str) -> Value) -> Value {
+        let get = |name: &str| -> Value {
+            match self.computed_idx(name) {
+                Some(j) => match self.scopes[j] {
+                    Scope::Row => row_vals[j].get(slot).cloned().unwrap_or(Value::Null),
+                    Scope::Node => node_vals[j].clone(),
+                    // A mixed column reading another mixed column would need a
+                    // second evaluation order; declaration order does not give
+                    // one, so this reads Null rather than recursing.
+                    Scope::NodeRow => Value::Null,
+                },
+                None => cache.col_index(name).map(|ci| cache.cell(slot, ci).clone()).unwrap_or(Value::Null),
+            }
+        };
+        self.computed[k].expr.eval(&get, agg)
+    }
+
+    fn collect(&self, cache: &TableCache, slots: &[usize], path: &[String], values: &[Json], level: usize, row_vals: &[Vec<Value>], out: &mut HashMap<Vec<String>, (Aggs, usize, Vec<Json>)>) {
         if level >= self.group_cols.len() { return; }
-        for (value, members) in group_slots(cache, slots, &self.group_cols[level]) {
+        for (value, members) in self.group_slots_scoped(cache, slots, &self.group_cols[level], row_vals) {
             let mut p = path.to_vec();
             p.push(group_key_string(&value));
             let mut v = values.to_vec();
             v.push(value.to_json());
-            out.insert(p.clone(), (aggregate_over(cache, &members, &self.aggs), members.len(), v.clone()));
-            self.collect(cache, &members, &p, &v, level + 1, out);
+            out.insert(p.clone(), (self.node_aggs(cache, &members, row_vals), members.len(), v.clone()));
+            self.collect(cache, &members, &p, &v, level + 1, row_vals, out);
         }
     }
 

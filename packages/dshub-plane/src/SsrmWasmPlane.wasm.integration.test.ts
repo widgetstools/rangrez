@@ -322,3 +322,82 @@ describe('watchGroups over an already-populated table', () => {
   });
 });
 
+describe('computed columns on a group watch', () => {
+  /**
+   * The engine folds each `agg` node PER GROUP NODE, so a caption can carry a
+   * weighted average. Pinned against the real wasm because it is the one
+   * behaviour a client cannot check for itself — a build without it accepts
+   * the same message and silently omits the column.
+   *
+   * `wv` weights each desk's `mv` by `w`. Rates: (10x1 + 20x9)/10 = 19.
+   * Credit: (30x9 + 40x1)/10 = 31. The book: (10+180+270+40)/20 = 25, which
+   * must land on neither.
+   */
+  const WCFG = {
+    ...cfg,
+    columnDefinitions: [
+      { field: 'id' }, { field: 'desk' },
+      { field: 'mv', cellDataType: 'number' },
+      { field: 'w', cellDataType: 'number' },
+    ],
+  } as SsrmPlaneConfig;
+  const WROWS = [
+    { id: 'r1', desk: 'Rates', mv: 10, w: 1 },
+    { id: 'r2', desk: 'Rates', mv: 20, w: 9 },
+    { id: 'r3', desk: 'Credit', mv: 30, w: 9 },
+    { id: 'r4', desk: 'Credit', mv: 40, w: 1 },
+  ];
+  const COMPUTED = [
+    { as: 'prod', version: 1,
+      expr: { k: 'bin', op: 'mul', l: { k: 'col', name: 'mv' }, r: { k: 'col', name: 'w' } } },
+    { as: 'wv', version: 1,
+      expr: { k: 'bin', op: 'div',
+              l: { k: 'agg', fn: 'sum', col: 'prod' },
+              r: { k: 'agg', fn: 'sum', col: 'w' } } },
+  ] as never;
+
+  async function watched(id: string) {
+    const plane = new SsrmWasmPlane(realHub);
+    await plane.boot(id, WCFG);
+    await plane.attachSession(`${id}s`);
+    await plane.ingest(id, WROWS, false);
+    plane.pollAllTicks();
+    await plane.watchGroups(`${id}s`, id, {
+      groupBy: ['desk'], aggregates: { mv: 'sum' }, computedColumns: COMPUTED,
+    });
+    const ticks = plane.pollAllTicks().get(id) ?? [];
+    const groups = ticks.filter((t) => t.kind === 'groupDelta').flatMap((t) => t.groups ?? []);
+    return new Map(groups.map((g) => [String((g as { values?: unknown[] }).values?.[0]), g]));
+  }
+
+  it('each caption carries its own weighted average', async () => {
+    const byDesk = await watched('wc');
+    expect(byDesk.get('Rates')).toMatchObject({ aggregates: { wv: 19 } });
+    expect(byDesk.get('Credit')).toMatchObject({ aggregates: { wv: 31 } });
+  });
+
+  it('and not the whole book\u2019s', async () => {
+    // 25 is what a single view-scoped fold produces, and it is wrong for both.
+    const byDesk = await watched('wc2');
+    for (const g of byDesk.values()) {
+      expect((g as { aggregates: Record<string, unknown> }).aggregates.wv).not.toBe(25);
+    }
+  });
+
+  it('the plain aggregates still arrive alongside', async () => {
+    // The feature must not displace what the watch already reported.
+    const byDesk = await watched('wc3');
+    expect(byDesk.get('Rates')).toMatchObject({ count: 2, aggregates: { mv: 30 } });
+  });
+
+  it('an unresolvable column is refused rather than silently dropped', async () => {
+    const plane = new SsrmWasmPlane(realHub);
+    await plane.boot('wc4', WCFG);
+    await plane.attachSession('wc4s');
+    await plane.ingest('wc4', WROWS, false);
+    await expect(plane.watchGroups('wc4s', 'wc4', {
+      groupBy: ['desk'], aggregates: { notional: 'sum' },
+    })).rejects.toThrow(/notional/);
+  });
+});
+

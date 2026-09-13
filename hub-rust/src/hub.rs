@@ -52,6 +52,18 @@ impl Hub {
             // different predicate than it displays — reject, never degrade.
             return Err(format!("invalid computed columns: {}", parsed.computed_errors.join("; ")));
         }
+        // Same refusal as `watchGroups`: a spec naming a column that does not
+        // resolve produced no value and no complaint, and the client painted
+        // an empty cell over a real number's place.
+        {
+            let c = cache.lock().unwrap();
+            let mut refs: Vec<(&str, String)> = Vec::new();
+            for g in &parsed.group_cols { refs.push(("group column", g.clone())); }
+            for a in &parsed.aggs { refs.push(("aggregate", a.column.clone())); }
+            for sp in &parsed.split_cols { refs.push(("splitBy column", sp.clone())); }
+            for k in &parsed.sort { refs.push(("sort column", k.column.clone())); }
+            crate::view::validate_columns(&c, &parsed.computed, &refs)?;
+        }
         self.view_seq += 1;
         let view_id = format!("v{}", self.view_seq);
         let view = crate::view::View::new(cache, parsed, String::new());

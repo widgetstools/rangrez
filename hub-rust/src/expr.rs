@@ -132,6 +132,32 @@ impl Expr {
         })
     }
 
+    /// Does a bare column reference appear OUTSIDE an `agg` node?
+    ///
+    /// This is what separates a computed column with one value per ROW from
+    /// one with a single value per aggregation scope. `spread * dv01` is the
+    /// former. `SUM(spread * dv01) / SUM(dv01)` is the latter, and only the
+    /// latter has a well-defined value to paint on a GROUP CAPTION — which is
+    /// the whole reason a group watch has to treat the two differently.
+    ///
+    /// `Agg` holds its column as a name, not a sub-expression, so an agg node
+    /// contributes no row reference of its own.
+    pub fn has_row_refs(&self) -> bool {
+        match self {
+            Expr::Col(_) => true,
+            Expr::Lit(_) | Expr::Agg { .. } => false,
+            Expr::Bin { l, r, .. } => l.has_row_refs() || r.has_row_refs(),
+            Expr::Un { a, .. } => a.has_row_refs(),
+            Expr::Fn { args, .. } => args.iter().any(Expr::has_row_refs),
+            Expr::In { a, list } => a.has_row_refs() || list.iter().any(Expr::has_row_refs),
+            Expr::Between { a, lo, hi } =>
+                a.has_row_refs() || lo.has_row_refs() || hi.has_row_refs(),
+            Expr::Cond { branches, els } =>
+                branches.iter().any(|(w, t)| w.has_row_refs() || t.has_row_refs())
+                    || els.as_ref().is_some_and(|e| e.has_row_refs()),
+        }
+    }
+
     /// Every `agg` node in this expression, depth-first: `(fn, column)` pairs.
     pub fn agg_refs(&self, out: &mut Vec<(String, String)>) {
         match self {

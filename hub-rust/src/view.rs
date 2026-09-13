@@ -22,6 +22,99 @@ pub struct ComputedCol {
     pub expr: Expr,
 }
 
+/// How a computed column behaves under an aggregation scope.
+///
+/// A view has ONE scope, so it folds each `agg` node once and every row shares
+/// the scalar. A group watch spans every node at every level, where "the
+/// scope" is a different row set per node — so the same expression can have
+/// one value per row, one per node, or one per row PER node.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Scope {
+    /// No agg nodes: one value per ROW, the same in whatever scope it is read.
+    Row,
+    /// Agg nodes only: one value per SCOPE. The only kind with a well-defined
+    /// value to paint on a group caption.
+    Node,
+    /// Both: varies per row AND with the scope the row is read in.
+    NodeRow,
+}
+
+impl ComputedCol {
+    pub fn scope(&self) -> Scope {
+        let mut refs = Vec::new();
+        self.expr.agg_refs(&mut refs);
+        match (refs.is_empty(), self.expr.has_row_refs()) {
+            (true, _) => Scope::Row,
+            (false, false) => Scope::Node,
+            (false, true) => Scope::NodeRow,
+        }
+    }
+}
+
+/// Reject a spec that names a column the engine cannot resolve.
+///
+/// Unknown columns used to vanish. `query::aggregate_over` maps every spec
+/// through `cache.col_index` and `continue`s on `None`, so an aggregate over a
+/// column that does not exist produced no value and no complaint, and the
+/// client painted an empty cell. A blank number on a blotter is the worst
+/// available signal — indistinguishable from a real zero — so the verb refuses
+/// the request and names the column instead.
+///
+/// `referenced` is `(what it is, column name)` so the message says which part
+/// of the spec is wrong, not merely that something is.
+pub fn validate_columns(
+    cache: &TableCache,
+    computed: &[ComputedCol],
+    referenced: &[(&str, String)],
+) -> Result<(), String> {
+    let mut bad: Vec<String> = Vec::new();
+    let known = |name: &str| {
+        computed.iter().any(|c| c.name == name) || cache.col_index(name).is_some()
+    };
+    for (kind, col) in referenced {
+        if !known(col) { bad.push(format!("{kind} \"{col}\"")); }
+    }
+    // An `agg` node may only fold something with a value PER ROW: a cache
+    // column, or a row-scoped computed column. Folding a node-scoped one is
+    // circular — that column's value is defined BY a fold.
+    for cc in computed {
+        let mut refs = Vec::new();
+        cc.expr.agg_refs(&mut refs);
+        for (f, c) in refs {
+            match computed.iter().find(|o| o.name == c) {
+                Some(o) if o.scope() != Scope::Row => bad.push(format!(
+                    "computed \"{}\": {f}({c}) folds a column that is itself defined by an aggregate",
+                    cc.name)),
+                Some(_) => {}
+                None if cache.col_index(&c).is_none() => bad.push(format!(
+                    "computed \"{}\": {f}({c}) names no such column", cc.name)),
+                None => {}
+            }
+        }
+    }
+    if bad.is_empty() { Ok(()) } else { Err(format!("unresolved: {}", bad.join("; "))) }
+}
+
+/// Parse a `computed` array (`[{as, expr}]`) into columns plus the entries
+/// that failed. Shared by `openView` and `watchGroups` so the two paths cannot
+/// drift on what a computed column IS — they differ only in how one is
+/// evaluated, which is enough difference already.
+pub fn parse_computed(spec: Option<&Json>) -> (Vec<ComputedCol>, Vec<String>) {
+    let mut computed = Vec::new();
+    let mut errors = Vec::new();
+    let Some(Json::Array(arr)) = spec else { return (computed, errors); };
+    for c in arr {
+        let name = c.get("as").and_then(Json::as_str).unwrap_or("").to_string();
+        if name.is_empty() { errors.push("computed column without `as`".into()); continue; }
+        match c.get("expr").map(Expr::from_wire) {
+            Some(Ok(expr)) => computed.push(ComputedCol { name, expr }),
+            Some(Err(err)) => errors.push(format!("computed \"{name}\": {err}")),
+            None => errors.push(format!("computed \"{name}\": missing expr")),
+        }
+    }
+    (computed, errors)
+}
+
 /// A parsed view spec.
 pub struct ViewSpec {
     pub filter: Filter,
@@ -75,19 +168,7 @@ impl ViewSpec {
         let split_cols = spec.get("splitBy").and_then(Json::as_array)
             .map(|a| a.iter().filter_map(|c| c.as_str().map(str::to_string)).collect())
             .unwrap_or_default();
-        let mut computed = Vec::new();
-        let mut computed_errors = Vec::new();
-        if let Some(arr) = spec.get("computed").and_then(Json::as_array) {
-            for c in arr {
-                let name = c.get("as").and_then(Json::as_str).unwrap_or("").to_string();
-                if name.is_empty() { computed_errors.push("computed column without `as`".into()); continue; }
-                match c.get("expr").map(Expr::from_wire) {
-                    Some(Ok(expr)) => computed.push(ComputedCol { name, expr }),
-                    Some(Err(err)) => computed_errors.push(format!("computed \"{name}\": {err}")),
-                    None => computed_errors.push(format!("computed \"{name}\": missing expr")),
-                }
-            }
-        }
+        let (computed, computed_errors) = parse_computed(spec.get("computed"));
         let watch = spec.get("watch").and_then(Json::as_bool).unwrap_or(false);
         ViewSpec { filter, sort, group_cols, aggs, split_cols, computed, computed_errors, watch }
     }

@@ -706,6 +706,18 @@ export class SsrmWasmPlane {
   ): Promise<void> {
     const hub = await this.host.ensure();
     await this.ensureSubscribed(hub, sessionId, providerId);
+    if (req.computedColumns?.length
+        && this.engineCaps().groupWatchComputedColumns !== true) {
+      // Every build before this capability existed parsed `groupBy` and
+      // `aggregates` off the raw cache and ignored `view.computed` entirely,
+      // so the columns would be absent from every caption with nothing said.
+      // That silence is the bug this whole path was fixed for — throwing is
+      // the point.
+      throw new Error(
+        '[ssrm] this engine build has no computed columns on group watches '
+        + '(capability groupWatchComputedColumns)',
+      );
+    }
     const id = this.ctlId();
     resultOf(
       this.control(hub, sessionId, {
@@ -714,6 +726,9 @@ export class SsrmWasmPlane {
         ref: { datasourceId: providerId, params: {} },
         groupBy: req.groupBy,
         aggregates: req.aggregates ?? {},
+        ...(req.computedColumns?.length
+          ? { view: { computed: req.computedColumns } }
+          : {}),
       }),
       id,
     );

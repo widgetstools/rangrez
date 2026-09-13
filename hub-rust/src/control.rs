@@ -158,12 +158,35 @@ pub fn handle_control(hub: &mut Hub, session: &mut Session, msg: &Json) -> Optio
                 return Some(err(&id, "invalid-params", "watchGroups needs a groupBy".into()));
             }
             let aggs = crate::groupwatch::parse_aggs(msg.get("aggregates").unwrap_or(&json!({})));
-            let filter = crate::query::Filter::from_json(msg.get("view").and_then(|v| v.get("filter")).unwrap_or(&Json::Null));
+            let view = msg.get("view");
+            let filter = crate::query::Filter::from_json(view.and_then(|v| v.get("filter")).unwrap_or(&Json::Null));
+            // Computed columns ride the watch the same way they ride a view —
+            // same wire form, same parser. What differs is that each `agg` node
+            // inside one is folded PER GROUP NODE rather than once per view, so
+            // a caption can carry `SUM(spread x dv01) / SUM(dv01)`.
+            let (computed, computed_errors) = crate::view::parse_computed(view.and_then(|v| v.get("computed")));
+            if !computed_errors.is_empty() {
+                // Same rule as `open_view`: a half-parsed spec would aggregate
+                // something other than what it reports. Reject, never degrade.
+                return Some(err(&id, "invalid-params",
+                    format!("invalid computed columns: {}", computed_errors.join("; "))));
+            }
             let Some(cache) = hub.registry.cache_for(&ds, &params) else {
                 return Some(err(&id, "no-subscription", format!("no subscription for \"{ds}\"")));
             };
+            // Refuse a watch naming columns that do not resolve, rather than
+            // silently dropping them and pushing blank aggregates forever.
+            {
+                let c = cache.lock().unwrap();
+                let mut refs: Vec<(&str, String)> = Vec::new();
+                for g in &group_by { refs.push(("group column", g.clone())); }
+                for a in &aggs { refs.push(("aggregate", a.column.clone())); }
+                if let Err(e) = crate::view::validate_columns(&c, &computed, &refs) {
+                    return Some(err(&id, "invalid-params", format!("watchGroups {e}")));
+                }
+            }
             let cms = conflate_ms_for(hub, &ds);
-            let mut w = crate::groupwatch::GroupWatch::new(ds.clone(), cache, filter, group_by, aggs, cms);
+            let mut w = crate::groupwatch::GroupWatch::new(ds.clone(), cache, filter, group_by, aggs, computed, cms);
             if let Some(m) = w.poll() { session.push(m); } // initial group snapshot
             let count = w.group_count();
             // REPLACE this session's watch on this datasource, do not stack a

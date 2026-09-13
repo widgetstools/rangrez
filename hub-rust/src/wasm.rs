@@ -324,6 +324,11 @@ impl RustHub {
         json!({
             "exprContract": 1,
             "computedColumns": true,
+            // Computed columns on a GROUP WATCH, with each `agg` node folded
+            // per group node rather than once per view. Separate from
+            // `computedColumns` because an engine can support one without the
+            // other — every build before this one did.
+            "groupWatchComputedColumns": true,
             "aggregates": ["sum", "avg", "count", "min", "max", "median", "stdev", "variance", "distinct_count"],
             "viewDeltas": true,
             "dateColumns": true,

@@ -98,6 +98,17 @@ export interface SsrmTickPayload {
 export interface SsrmWatchGroupsRequest {
   groupBy: readonly string[];
   aggregates?: Record<string, string>;
+  /**
+   * Engine-computed columns riding this watch (same wire form as a view's).
+   *
+   * Each `agg` node inside one is folded PER GROUP NODE, not once for the
+   * whole watch — so `SUM(spread * dv01) / SUM(dv01)` gives each group its own
+   * weighted average rather than the book's. A column whose expression is
+   * built only from agg nodes arrives on the group's `aggregates` under its
+   * `as` name; one that varies per row has no single value for a group row and
+   * must be named in `aggregates` to say how to fold it.
+   */
+  computedColumns?: readonly SsrmComputedColumnSpec[];
 }
 
 /**
