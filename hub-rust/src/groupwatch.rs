@@ -7,6 +7,28 @@
 //! aggregates over the full cache each tick, diffs them against the last, and
 //! pushes ONLY the group paths whose aggregate actually changed (plus any that
 //! vanished). The client refreshes exactly those group rows.
+//!
+//! COST, measured in a browser on a 50k-row book grouped desk -> region, nine
+//! samples, median, with four plain aggregates:
+//!
+//! | levels | plain  | + 2 computed columns |
+//! |--------|--------|----------------------|
+//! | 1      | 15.4ms | 26.4ms               |
+//! | 2      | 30.7ms | 45.9ms               |
+//! | 3      | 46.2ms | 66.2ms               |
+//!
+//! `poll()` rebuilds the whole snapshot every tick, so that is the STANDING
+//! per-tick cost of a live grouped blotter, not a one-off on regrouping — at a
+//! 100ms tick, two levels with computed columns is ~46% of a core. The
+//! computed overhead is a fixed ~11ms (the row-scoped pass over every filtered
+//! row) plus ~4.5ms per extra level for the per-node folds; evaluating
+//! row-scoped columns per node instead of once would have made it ~15ms per
+//! level, which is why `snapshot` hoists them.
+//!
+//! The obvious next move is incremental: `View` already patches its computed
+//! memo per revision off the cache's touch log, and this path could diff the
+//! touched slots instead of rescanning. Nothing here depends on the full scan
+//! except the diff in `poll`, which is already keyed by group path.
 
 use crate::expr::client_aggregate;
 use crate::query::{filtered_slots, group_key_string, AggSpec, Filter, MultiAcc};
